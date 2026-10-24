@@ -1,0 +1,112 @@
+# dark-basic-pro-decompiler
+
+Turns a compiled DarkBASIC PRO game back into readable BASIC, without ever
+running the program or the compiler.
+
+A compiled DBP game carries a `_virtual.dat` blob whose Machine Code Block is a
+fully symbolic instruction stream: the compiler wrote it through `CASMWriter`
+(`DBProCompiler/DBPCompiler/ASMWriter.cpp`), recording every 32-bit operand in a
+reference table and leaving a placeholder in the stream. Applying that table
+decodes the block; the shapes it contains then read back as statements.
+
+```
+dbp-decompile playagain/_virtual.dat          # the whole pipeline
+dbp-list     playagain/_virtual.dat --from 0x100
+dbp-extract  game.exe -o out/                 # pull the blob out of a game
+```
+
+`dbp-decompile` writes four files:
+
+| file | what it is |
+|---|---|
+| `listing.asm` | every instruction, fully symbolised, with its raw bytes |
+| `recovered.dba` | one BASIC statement per line, a direct transcription |
+| `readable.dba` | the same program after the readability pass |
+| `report.txt` | what was found, and the checks that ran |
+
+## What it recovers
+
+* the container (display mode, DLLs, commands, strings, variable space) and the
+  instruction stream with its references applied;
+* statements: library command calls, assignments, array reads and stores,
+  comparisons and arithmetic;
+* control flow: `IF/THEN`, `REPEAT/UNTIL`, `DO/LOOP`, `FOR/NEXT` and user
+  `FUNCTION/ENDFUNCTION`, recovered from the branch graph;
+* readability: scratch variables copy-propagated and dead stores deleted,
+  DBP operator calls (`EQUAL`, `ADD`, `CAST INTEGER TO DOUBLE` ...) rewritten as
+  operators, IEEE-754 immediates re-typed as decimals, the compiler's loop
+  lowering undone, and variables named after the role their use implies.
+
+Undecoded regions are never hidden: they stay in the output as a comment
+carrying the raw instructions, and they are counted in the report.
+
+## Checks it runs
+
+* every reference slot is consumed exactly once, and the reference table lines
+  up with the machine code;
+* every instruction belongs to exactly one statement;
+* `IF/ENDIF`, `FOR/NEXT` and `FUNCTION/ENDFUNCTION` balance;
+* the readability rewrite does not change how many side-effecting calls run --
+  a clock, a random sequence or a DLL command stays where the compiler put it.
+
+A non-empty warning list makes `dbp-decompile` exit non-zero.
+
+## Performance
+
+The stages, measured with `cargo bench --bench decompile` on the sample program
+(2461 bytes of machine code, 601 instructions, 112 recovered statements):
+
+| stage | |
+|---|---|
+| container parse | 141 µs |
+| listing | 149 µs |
+| statements and control flow | 99 µs |
+| readability pass | 1.19 ms |
+| whole pipeline | 1.70 ms |
+
+On a larger program -- the 1.1 MB blob of *Remember* (365 KB of machine code,
+87 045 instructions, 5437 statements, 57 functions) -- the whole pipeline takes
+0.5 s, against 11 s for the Python toolchain it was ported from, and produces
+byte-identical output.
+
+The readability pass recognises each statement's shape with the hand-written
+matchers in `src/patterns.rs`. `cargo bench --bench patterns` measures them
+against the regexes they replaced: 3.1 µs per transcription against 23.3 µs for
+the equivalent compiled set, because compiling that set costs more than matching
+it does.
+
+## Layout
+
+| module | |
+|---|---|
+| `container` | the `_virtual.dat` sections and the symbolic decoder |
+| `templates` | the instruction templates `CASMWriter` emits |
+| `names` | DLL export name -> DBP keyword |
+| `listing` | the symbolised listing |
+| `decompile` | statements, expressions, control flow, the transcription |
+| `patterns` | the statement shapes the readability pass recognises |
+| `tidy` | the readability pass |
+| `extract` | finding the blob inside a compiled game |
+| `pipeline` | the whole run, and the checks |
+
+## Building
+
+```
+cargo build --release
+cargo test
+cargo bench
+```
+
+Compressed containers (`compress.dll`) can only be expanded on Windows, where
+the bundled DLL can be loaded; elsewhere the tool says so and asks for
+`--compress-dll` on a Windows host.
+
+The sample program in `tests/data/` is a `_virtual.dat` taken from a compiled
+game; the tests and benchmarks run against it.  The port was validated against
+a second, much larger program as well -- see `DBPRO-EXE-FORMAT.md` for what
+that blob contains.
+
+Two documents sit alongside this one.  `DBPRO-EXE-FORMAT.md` describes the
+container and the symbolic machine code block.  `PATCHING.md` describes editing
+one: changing a constant, a variable, a command call or an instruction, and
+checking the change landed.

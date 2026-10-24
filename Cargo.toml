@@ -1,0 +1,36 @@
+[package]
+name = "dark-basic-pro-decompiler"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Static decompiler for DarkBASIC PRO compiled programs (_virtual.dat machine code block)"
+license = "MIT"
+
+[lib]
+name = "dbp"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+regex = "1"
+
+[[bench]]
+name = "decompile"
+harness = false
+
+[[bench]]
+name = "patterns"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+debug = true

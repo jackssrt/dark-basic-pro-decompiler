@@ -1,0 +1,396 @@
+# DarkBASIC PRO `_virtual.dat` — format and decompilation notes
+
+Everything below was derived from the compiler source in this repository
+(`DBProCompiler/DBPCompiler/`) and verified byte-for-byte against
+`dbpdata_remember/_virtual.dat` from the *Remember* executable.
+
+## 1. How DarkEXE loads and runs the compiled program
+
+`DBProCompiler/DBPCompilerEXE/DarkEXE.cpp`:
+
+1. `WinMain` extracts the appended file table into `%TEMP%\dbpdataN\`
+   (`CFileReader::CreateVirtualFileTable`).  That directory contains all the
+   DBPro DLLs and `_virtual.dat`.
+2. `CEXE.StartInfo(unpackDir, key)` then `CEXE.Load(<tmp>\\_virtual.dat)`
+   (`EXEBlock::Load`, `EXEBlock.cpp:522`).
+3. `CreateTempWindow`, then `RunProgram` → `CEXE.Init` → `CEXE.Run`.
+4. `CEXE.Run` (`EXEBlock.cpp:1565`) is literally:
+
+```cpp
+g_CORE_Program = ( GDI_RetVoidParamVoidPFN ) m_pMachineCodeBlock;
+g_CORE_Program();
+```
+
+`m_pMachineCodeBlock` is loaded with `PAGE_EXECUTE_READWRITE`
+(`LoadValueArrayBytes`, `EXEBlock.cpp:558`), so calling it as a bare
+`void(*)(void)` works.  No stack frame is needed because **the machine code
+block is a complete x86 function**: it begins with
+
+```
+60                    PUSHAD
+89 25 <@$_ESP_>       MOV dword[@$_ESP_], ESP
+```
+
+and ends with `8B 25 <@$_ESP_> / 61` (`MOV ESP,[@$_ESP_]` / `POPAD`).
+`@$_ESP_` is a reserved variable-space slot at byte offset 0, saved by
+`BUILD_STARTPROGRAM` (`ParseInstruction.cpp:582`) and restored by
+`BUILD_ENDPROGRAMANDQUIT`, so the prologue/epilogue balance is preserved even
+though the compiler never emits `PUSH EBP / MOV EBP,ESP`.
+
+Everything between is straight-line x86 plus `CALL EBX` into the DBPro DLLs.
+The "commands" are not called by name: the compiler stores an index into a
+**command table** and patches it at load time (see §4).
+
+`CEXE.Init` also links the DLLs (`GetProcAddress` for each exported symbol) and
+resolves the escape/break variables the runtime uses for `END` and `BREAK`.
+
+## 2. `_virtual.dat` container layout
+
+Straight from `CEXEBlock::Load` / `Save`.  All integers little-endian DWORDs.
+
+| # | field | encoding |
+|---|---|---|
+| 1 | `m_dwInitialDisplayMode` | DWORD — 0 hidden, 1 windowed, 2 windowed desktop, 3 full exclusive, 4 windowed fullscreen |
+| 2 | `m_dwInitialDisplayWidth` | DWORD |
+| 3 | `m_dwInitialDisplayHeight` | DWORD |
+| 4 | `m_dwInitialDisplayDepth` | DWORD |
+| 5 | `m_pInitialAppName` | fixed **256 bytes** (window caption; rest is padding) |
+| 6 | DLL count + index array + name strings + "already loaded" array | |
+| 7 | reference count, then three DWORD arrays: position, type, index | |
+| 8 | runtime error string table | |
+| 9 | **`m_dwSizeOfMCB`** then that many raw bytes of machine code | |
+| 10 | command count, DLL-id array, decorated-name string array | |
+| 11 | string table (count + length-prefixed strings) | |
+| 12 | DATA items: count, `count*10` bytes, then `count` strings | |
+| 13 | variable-space size, data-space size | |
+| 14 | dynamic variable offsets + types | |
+| 15 | user-type pattern blob | |
+
+A string array entry is `DWORD length` followed by `length` bytes (no NUL).
+A value array entry is `count` DWORDs; a byte array is `count` bytes.
+
+For *Remember*: 40 DLLs, 55862 references, 9999 error strings, MCB 365233 bytes,
+342 commands, 336 strings, no DATA, variable space 1603 bytes, 23 dynamic
+variables, 2562 bytes of user-type patterns.
+
+## 3. The machine code block is already symbolic
+
+This is the key observation.  `CASMWriter::CreateASMMiddleCore`
+(`ASMWriter.cpp:433`) emits an operand as the 32-bit placeholder `0xFFFFFFFF`
+and records the byte offset in `m_pProgramRefs`.
+`CASMWriter::UpdateMCBRefData` (`ASMWriter.cpp:1579`) later classifies each
+reference, and `CEXEBlock::Init` (`EXEBlock.cpp:1398-1541`) substitutes the real
+value at run time.  An operand the ref table covers is therefore `0xFFFFFFFF`
+on disk, and the ref table says what it should be.
+
+**A literal constant is the exception.**  A number the programmer wrote is
+emitted as its real bytes and gets *no* ref slot, so it sits in the block as an
+ordinary immediate.  In *Remember* that is 5492 operands against 22822 that do
+go through the table, and the split is not cosmetic: patching a ref-backed
+operand means editing the ref table, patching a literal means editing the code.
+`PATCHING.md` covers both, and how to tell them apart.
+
+Reference types:
+
+| type | meaning | value |
+|---|---|---|
+| 1 | DLL command call | index into the command table |
+| 2 | string literal | index into the string table |
+| 3 | variable | byte offset into the variable space |
+| 4 | immediate | the literal itself (compiler-generated constants only) |
+| 5 | label | byte offset of a jump target in the MCB |
+| 6 | DATA label | index into the data space |
+
+Decoding the MCB therefore needs no disassembly heuristics beyond the opcode
+table itself, which is `CASMWriter::GenerateASMCodes` (`ASMWriter.cpp:100-379`).
+Transcribing that table gives a complete, exact decoder: the *Remember* MCB
+decodes to 87045 instructions with **zero** undecodable bytes, and all 55862
+references are consumed exactly once.
+
+The decoder tells the two apart from the ref table alone: an operand whose byte
+offset appears in `refpos` is ref-backed, and one that does not is a literal
+read straight out of the block (`container.rs:386-417`).
+
+Two traps in that table:
+
+* Templates whose operand slot exists but is always written empty
+  (`PUSH EAX`, `PUSH EBP`, `MOV EBP ESP`, `MOV EAX ECX4`, …).  Deciding by the
+  ref table alone makes the decoder swallow the next instruction's operand.
+* Two-operand forms via `WriteASMLine2`/`2IMM`: `MOV dword[MEM],IMM`
+  (`C7 05 addr value`), `MOV SIB[...],IMM`, `LOOP`.
+
+`LOOP` is written as `E2` followed by a 4-byte immediate but the write pointer
+only advances one byte (`CreateASMMiddleCore` case 0), so only the `rel8` is
+real; the following three bytes are overwritten by the next instruction.
+
+## 4. Statement boundaries and line numbers
+
+Every BASIC statement is preceded by the runtime-error hook emitted by
+`ASMTASK_RUNTIMEERRORHOOK` (`ASMWriter.cpp:3825`):
+
+```
+C7 05 <ref @16> <ref:line>    MOV dword[@$_SLN_], <source line>
+A1  <ref @4>                  MOV EAX, [@$_ERR_]
+3D  <ref 0>                   CMP EAX, 0
+0F 85 <ref $labelend>         JNE $labelend
+```
+
+`@16` is the reserved slot `$_SLN_` (`VarTable.cpp` `SetVarDefaults`:
+`$_ESP_`=0, `$_ERR_`=4, `$_ESC_`=8, `$_REK_`=12, `$_SLN_`=16, `$_TEMPA_`=20,
+`$_TEMPB_`=24).  **The immediate is the original BASIC line number**, so the
+statement order and the original line numbering come back exactly: *Remember*
+recovers 5363 statement markers over 2765 distinct source lines.
+
+## 5. Code-generation patterns worth knowing
+
+All operand order rules come from `MathOp::WriteDBMBit` (`MathOp.cpp:2556`),
+which passes the **LEFT operand as P1** and the **RIGHT as P2**, while
+`WriteASMTaskCore` emits **P2 first**.  So in the instruction stream *the first
+value loaded is the right-hand operand*.
+
+### Library command call
+
+```
+<argN> PUSH EAX ... <arg1> PUSH EAX     (right to left)
+MOV EBX, <command index>                BB <ref type 1>
+CALL EBX                                FF D3
+[MOV <dest>, EAX]                       ; statement-level calls store first
+POP EBX x n
+```
+
+Expression-level calls (the DLL-call path in `WriteDBMBit`) pop first and
+store afterwards; both orders are accepted.
+
+### Arithmetic (hard-coded, integer types only)
+
+```
+<right>  PUSH EAX
+<left>                    (EAX = left, EBX = right after the pop)
+POP EBX
+ADD/SUB/AND/OR/XOR/IMUL  EAX,EBX
+MOV <dest>, EAX
+```
+
+With an immediate right operand it collapses to `<left>; ADD EAX,imm`.
+
+### Comparison
+
+```
+<right>  PUSH EAX
+<left>   MOV EBX,EAX
+         POP EDX                      ; EDX = right
+         MOV EAX,0                    ; SETcc only writes AL
+         CMP EBX,EDX                  ; opcode 3B DA = CMP EBX,EDX
+         SETE/SETNE/SETG/SETGE/SETL/SETLE EAX
+MOV <tmp>, EAX
+```
+
+`CMP EBX,EDX` computes `left - right`, so `SETG` is `>` on the source
+left/right pair.  The compiler's own template name for `3B DA` ("CMP EDX EBX")
+is mislabelled — that misreading inverts every comparison operator.
+
+### IF
+
+The comparison task emits no branch.  The enclosing statement emits
+`ASMTASK_CONDITION` + `ASMTASK_CONDJUMPE`:
+
+```
+<load condition>   [NOT EAX]   CMP EAX,0   JE <else/endif>
+```
+
+`NOT` in the source sets a writer-global flag that inverts this to `JNE` and
+inserts the `NOT EAX`.
+
+### FOR / NEXT
+
+`CStatement::DoLoop` (`Statement.cpp:686-1135`) lowers `FOR v = a TO b STEP s`
+to three separate statements:
+
+```
+v = a - s                 (initialiser, before the loop)
+L:  v = v + s              (the loop label points at the increment)
+    <tmp> = v <= b
+    IF <tmp> <> 0 THEN GOTO exit
+    ...body...
+    JMP L
+```
+
+which is exactly what `decompile.py:for_loop` recognises.
+
+### Arrays
+
+`arr(i) = v` carries the bounds check inline: pointer load, `CMP EAX,0 / JE`,
+`POP EBX`, subscript→temp, value, then `MOV EDX,[EAX-16] / CMP / JGE`,
+`CMP EBX,-1 / JLE`, `MOV EAX,[EAX+EBX*4]`, `MOV [EAX+off],ECX`, and an
+unreachable `MOV dword[@$_ERR_],118` error block.
+
+### User functions
+
+`PUSH EBP / MOV EBP,ESP / SUB ESP,n` + a stack-clearing loop, and
+`MOV ESP,EBP / POP EBP / RET`.  Parameters arrive at `[EBP+8]`, `[EBP+12]`, …
+and locals/temps at negative offsets (`CParseUserFunction::ActOnLocalVars`).
+Calls are `CALL rel32` to the label `$label <name>`.
+
+## 6. Tooling in this directory
+
+| file | purpose |
+|---|---|
+| `dbp/decompile_all.py` | runs the whole pipeline; start here |
+| `dbp/dbp_extract.py` | pulls `_virtual.dat` out of a game exe or .pck |
+| `dbp/dbpdis.py` | container parser + symbolic disassembler (exact, 0 undecodable bytes) |
+| `dbp/listing.py` | emits the fully symbolised assembly listing |
+| `dbp/names.py` | decorated DLL export → DarkBASIC keyword |
+| `dbp/decompile.py` | statement-level decompiler and control-flow structurer |
+| `dbp/tidy.py` | readability pass over `recovered.dba` |
+| `mcb_listing.asm` | 87045-line symbolised listing of the machine code block |
+| `recovered.dba` | recovered BASIC, machine-faithful, one statement per line |
+| `readable.dba` | the same program as source you can read |
+
+One command, from a game executable or from a blob:
+
+```sh
+python3 dbp/decompile_all.py game.exe -o out/
+```
+
+That writes `listing.asm`, `recovered.dba`, `readable.dba` and `report.txt`,
+then checks its own work and exits non-zero if a check fails.  The stages are
+also runnable on their own:
+
+```sh
+python3 dbp/dbp_extract.py game.exe -o out/          # just the blob
+python3 dbp/listing.py    out/_virtual.dat > mcb_listing.asm
+python3 dbp/decompile.py  out/_virtual.dat recovered.dba
+python3 dbp/tidy.py       recovered.dba readable.dba
+```
+
+`recovered.dba` is the artifact to check a claim against: it is a direct
+transcription of the machine code, so every statement in it can be checked
+against the listing.  `readable.dba` is the same program after the passes in
+§7.
+
+Neither the compiler nor the target executable is executed; everything is static
+parsing of the on-disk blob.
+
+### What the driver checks
+
+The checks are what make the pipeline trustworthy on a program it has never
+seen, so they run every time and a failure is a non-zero exit:
+
+| check | what would make it fire |
+|---|---|
+| container | trailing bytes, undecodable bytes, unused reference slots, no commands |
+| references | the decoded code consumes exactly as many reference slots as the table holds — the decoder has no leftovers and no double reads |
+| transcription | an instruction belongs to no statement — a gap would have swallowed code |
+| coverage | more than 10% of the code is still undecoded |
+| side effects | the rewrite changed how many times any call that reads the clock, the random sequence or the world runs |
+| structure | IF/ENDIF, FOR/NEXT or FUNCTION/ENDFUNCTION do not balance |
+
+The side-effect check is the important one: it is what stops a readability
+pass from quietly duplicating a `RND()` or dropping a `TIMER()`.
+
+### How much of each program is decoded
+
+`report.txt` prints the undecoded remainder as both a count of regions and the
+bytes those regions cover, because the count alone is misleading: one large
+region that splits into a decoded statement plus a smaller gap raises the
+count while lowering the bytes.  The warning fires above 10% of the code, so a
+program that has quietly stopped decoding cannot pass as clean.
+
+| program | statements | commands | undecoded |
+|---|---|---|---|
+| `null.exe` | 117 | 22 | 11 of 2,266 bytes (0.49%) |
+| `unknown.exe` | 1,999 | 640 | 534 of 42,409 bytes (1.26%) |
+| `Remember` | 16,662 | 6,127 | 4,482 of 365,233 bytes (1.23%) |
+| `lostmemory.exe` | 39,317 | 7,736 | 53,497 of 841,740 bytes (6.36%) |
+
+Three things account for most of what is still missing.  The array-of-user-type
+recognisers need the pointer arithmetic the compiler wraps around a subscript,
+and that preamble sits at a different offset in each context it appears in;
+user-function prologues that save several parameters before the body are only
+recognised in the shapes seen so far; and the rest is short fragments — a
+register shuffle, a `POP`, a table load — that carry no statement of their own.
+
+### Why nothing is ever dropped
+
+Decoding runs in two passes.  The first walks the instruction stream and each
+recogniser claims what it understands; the rest becomes a *gap*, transcribed
+verbatim as comments.  The second pass re-runs the same recognisers at every
+instruction address *inside* each gap, because a compiler preamble — saving a
+value, stashing it, loading a table — routinely sits in front of a shape that
+is perfectly recognisable, and the first pass never gets past it to see it.
+
+That second pass is what takes `lostmemory.exe` from 38.8% undecoded to 6.4%,
+and `Remember` from 4.1% to 1.2%.  It is also why gap *counts* went up while
+gap *bytes* went down: one 108-byte region became a decoded statement plus
+several small gaps, which is a win, not a regression.
+
+The driver checks the invariant that makes this safe — every instruction in the
+block belongs to some statement, so refining a gap cannot lose code — and
+reports it on every run.
+
+## 7. Reading the recovered program
+
+`recovered.dba` is a transcription: every line corresponds to statements in
+the listing, which is what makes it checkable.  It is not readable.  `dbp/tidy.py`
+rewrites it as `readable.dba`, which is the same program with:
+
+* the source-line markers gone (statement order is unchanged, and
+  `recovered.dba` still has every original line number);
+* the compiler's scratch variables inlined through straight-line code, and the
+  stores that nothing reads deleted;
+* library operator calls written back as operators — `EQUAL`/`GREATER`/`LESS`
+  as `=`/`>`/`<`, `ADD`/`SUB`/`MUL`/`DIV` as `+`/`-`/`*`/`/`, and
+  `CAST ... TO DOUBLE/FLOAT` as the value itself;
+* literals re-typed the way DBP would have written them: a DWORD with the high
+  bit set is negative (`4294965296` is `-2000`), and an IEEE-754 bit pattern
+  that decodes to a short decimal becomes that decimal (`1073741824` is `2.0`,
+  `1050253722` is `0.3`).  The float test is a round-trip: the decimal must
+  encode back to the same 32 bits, which is what separates a literal the
+  programmer typed from a value the program computed;
+* the loop lowering undone (`FOR`/`NEXT` come back), the
+  `IF c THEN ... GOTO L ENDIF ... L:` shape turned into a real `IF/ELSE`, and
+  jumps to the program epilogue turned into `END`;
+* variables renamed from the role their use implies, with a legend in the file
+  mapping each name back to its byte offset.
+
+Two rules keep this pass from changing what the program does:
+
+* **only side-effect-free values move.**  A call — `RND`, `TIMER`, `GET ...`,
+  any DLL command — stays exactly where the compiler put it, because moving one
+  changes its value (a clock and a random sequence both advance) and inlining
+  it twice evaluates it twice.  The number and order of such calls in
+  `readable.dba` is identical to `recovered.dba`.
+* **a definition is dropped only where it cannot be reached.**  Where the
+  decompiler's block boundaries and the program's own disagree — an `IF` the
+  decompiler closed early, which happens in a few places — a condition that
+  folded to a constant is *derived*, not written in the source, so its branch
+  is kept rather than deleted.
+
+Names are role-based rather than recovered: the format stores byte offsets, so
+the identifiers are simply not in the file.  `i`/`j` are loop counters by
+nesting depth, `t` a `TIMER()` snapshot, `path` a file path, `arr` an array,
+`rec` a user-type record, `f` a float, `n` an integer, `p`/`v` a function's
+parameters and locals.  The BASIC keyword for each command is reconstructed
+from the demangled DLL export; a handful (`SC_*`, and the `*DDD`/`*FFF`/`*OOO`/
+`*SS` maths variants) collapse onto the same keyword and should be read with
+the argument count in mind.
+
+### Recovered result for *Remember*
+
+`recovered.dba` is 19992 lines covering:
+
+* 6062 of 6138 library command calls (98.7%), with their arguments in source order
+* 2627 assignments, comparisons, arithmetic expressions and array stores
+  (including the `DIM ARRAY` initialisers)
+* 798 IF/ENDIF blocks (up to 5 levels deep), 44 FOR/NEXT loops,
+  25 DO/LOOP loops, 57 FUNCTION/ENDFUNCTION blocks
+* the original line number for every statement (2765 distinct source lines)
+* 377 gap regions (2.4% of statements), emitted inline as commented raw
+  instructions so nothing is silently lost
+
+`readable.dba` is the same program in 9761 lines, with the same 377
+undecoded regions and the same 3360 side-effecting calls.
+
+Not recovered: variable *identifiers*, comments and REM statements, and the
+argument-count-driven keyword distinctions where several DBP keywords share one
+DLL export.
