@@ -7,6 +7,7 @@
 //! * [`container`] parses the blob and applies the reference tables,
 //! * [`listing`] prints the symbolised instruction listing,
 //! * [`decompile`] recovers statements and control flow,
+//! * [`image`] rebuilds the executable ELF32 image of the machine code block,
 //! * [`tidy`] rewrites the transcription to be readable,
 //! * [`extract`] pulls the blob out of a compiled game executable,
 //! * [`pipeline`] runs the whole thing and reports what it found.
@@ -26,9 +27,11 @@
 pub mod container;
 pub mod decompile;
 pub mod extract;
+pub mod image;
 pub mod listing;
 pub mod names;
 pub mod patterns;
 pub mod pipeline;
 pub mod templates;
 pub mod tidy;
+pub mod utypes;

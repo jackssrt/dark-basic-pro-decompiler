@@ -23,40 +23,46 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::patterns::{self, Shape};
 use std::fmt::Write as _;
 
-/// Address the compiler's program epilogue lives at.
-pub const PROG_END: &str = "L59292";
-
-/// The header `readable.dba` opens with.
-pub const HEADER: &str = "\
-' ======================================================================
-' Remember -- DarkBASIC PRO, recovered as readable source
-'
-' Produced from recovered.dba by dbp-decompile.  Nothing was executed: this is a
-' static reading of the compiled machine code in _virtual.dat.
-'
-' Reading notes
-'   * statement order is the original one, and variables are named for the
-'     role their use implies -- loop counter, elapsed-time reference, file
-'     path, array, user-type record.  The real identifiers are not in the
-'     format (it stores byte offsets, not names), so every name below was
-'     inferred; recovered.dba lists each one against its offset.
-'   * calls with side effects -- RND, TIMER, GET ..., every DLL command --
-'     stay exactly where the compiler put them, so their number and order
-'     match recovered.dba.  Only side-effect-free values are inlined.
-'   * library operator calls are written back as operators:
-'       EQUAL / GREATER / LESS      ->  = > <
-'       ADD / SUB / MUL / DIV       ->  + - * /
-'       CAST ... TO DOUBLE / FLOAT  ->  the value itself
-'   * literals are re-typed the way DBP would have written them: a DWORD with
-'     the high bit set is negative (4294965296 -> -2000), and an IEEE-754 bit
-'     pattern that decodes to a short decimal becomes that decimal
-'     (1073741824 -> 2.0, 1050253722 -> 0.3).
-'   * the compiler's loop lowering is undone, the IF ... GOTO L / L: shape
-'     becomes a real IF/ELSE, and a jump to the program epilogue becomes END.
-'   * regions this pass could not decode are kept as one-line comments
-'     carrying the raw instructions, so nothing is hidden.
-' ======================================================================
-";
+/// The header `readable.dba` opens with, named for the program it came from.
+pub fn header(appname: &str) -> String {
+    let name = if appname.is_empty() {
+        "a compiled DBP game"
+    } else {
+        appname
+    };
+    let rule = "' ======================================================================\n";
+    let mut h = String::from(rule);
+    h.push_str(&format!("' {name} -- DarkBASIC PRO, recovered as readable source\n"));
+    h.push_str(
+        "'\n\
+         ' Produced from recovered.dba by dbp-decompile.  Nothing was executed: this is a\n\
+         ' static reading of the compiled machine code in _virtual.dat.\n\
+         '\n\
+         ' Reading notes\n\
+         '   * statement order is the original one, and variables are named for the\n\
+         '     role their use implies -- loop counter, elapsed-time reference, file\n\
+         '     path, array, user-type record.  The real identifiers are not in the\n\
+         '     format (it stores byte offsets, not names), so every name below was\n\
+         '     inferred; recovered.dba lists each one against its offset.\n\
+         '   * calls with side effects -- RND, TIMER, GET ..., every DLL command --\n\
+         '     stay exactly where the compiler put them, so their number and order\n\
+         '     match recovered.dba.  Only side-effect-free values are inlined.\n\
+         '   * library operator calls are written back as operators:\n\
+         '       EQUAL / GREATER / LESS      ->  = > <\n\
+         '       ADD / SUB / MUL / DIV       ->  + - * /\n\
+         '       CAST ... TO DOUBLE / FLOAT  ->  the value itself\n\
+         '   * literals are re-typed the way DBP would have written them: a DWORD with\n\
+         '     the high bit set is negative (4294965296 -> -2000), and an IEEE-754 bit\n\
+         '     pattern that decodes to a short decimal becomes that decimal\n\
+         '     (1073741824 -> 2.0, 1050253722 -> 0.3).\n\
+         '   * the compiler's loop lowering is undone, the IF ... GOTO L / L: shape\n\
+         '     becomes a real IF/ELSE, and a jump to the program epilogue becomes END.\n\
+         '   * regions this pass could not decode are kept as one-line comments\n\
+         '     carrying the raw instructions, so nothing is hidden.\n\
+         ' ======================================================================\n",
+    );
+    h
+}
 
 /// One entry of the header legend: `(new name, old offset, why)`.
 pub type Legend = Vec<(String, String, String)>;
@@ -597,6 +603,9 @@ fn norm_int(v: i64) -> i64 {
 const PURE: &[&str] = &[
     "ABS", "SQR", "INT", "ROUND", "SIN", "COS", "TAN", "ATN", "EXP", "LEN", "LEFT", "RIGHT", "MID",
     "CHR", "ASC", "UPPER", "LOWER", "INSTR", "SPACE", "STR", "VAL", "REPLACE", "POW",
+    // `ARRAY INDEX(arr)` reads the array's list cursor; only the commands that
+    // move it (`NEXT ARRAY INDEX`, `ARRAY INDEX TO TOP`) have a side effect.
+    "ARRAY INDEX",
 ];
 
 fn cmp_fn(name: &str) -> Option<&'static str> {
@@ -623,6 +632,8 @@ fn is_pure(e: &Expr) -> bool {
         Expr::Call(n, args) => {
             PURE.contains(&n.to_uppercase().as_str()) && args.iter().all(is_pure)
         }
+        Expr::Arr(base, idx) => is_pure(base) && is_pure(idx),
+        Expr::Fld(base, _) => is_pure(base),
         Expr::Bin(_, l, r) => is_pure(l) && is_pure(r),
         Expr::Un(_, x) => is_pure(x),
         _ => true,
@@ -720,6 +731,13 @@ fn fold_call(name: &str, args: &[Expr], dst: Option<&str>) -> Option<Expr> {
     {
         return Some(Expr::Bin(
             op.to_string(),
+            Box::new(args[0].clone()),
+            Box::new(args[1].clone()),
+        ));
+    }
+    if up == "ADD" && args.len() == 2 {
+        return Some(Expr::Bin(
+            "+".to_string(),
             Box::new(args[0].clone()),
             Box::new(args[1].clone()),
         ));
@@ -987,6 +1005,10 @@ struct Stmt {
     expr: Option<Expr>,
     didx: Option<Expr>,
     dst: Option<String>,
+    /// `arr(i).field` -- the field offset written after an element access.
+    dfield: Option<String>,
+    /// The value a `CASE` test compares against, when it is not zero.
+    cmp: Option<String>,
     target: Option<String>,
     cc: Option<&'static str>,
     var: Option<String>,
@@ -1012,6 +1034,8 @@ impl Stmt {
             expr: None,
             didx: None,
             dst: None,
+            dfield: None,
+            cmp: None,
             target: None,
             cc: None,
             var: None,
@@ -1252,11 +1276,14 @@ fn parse_stmt(s: &str, line: Option<u32>, ids: &mut Ids) -> Option<Stmt> {
         Some(Shape::If {
             cond,
             op,
+            value,
             target: Some(target),
         }) => {
             let mut n = Stmt::new(K::IfGoto, id);
             n.expr = parse_expr(cond).ok();
             n.cc = Some(if op == "<>" { "<>" } else { "=" });
+            // the `CASE` form compares against its own value
+            n.cmp = value.map(str::to_string);
             n.target = Some(target.to_string());
             n.line = line;
             return Some(n);
@@ -1264,11 +1291,13 @@ fn parse_stmt(s: &str, line: Option<u32>, ids: &mut Ids) -> Option<Stmt> {
         Some(Shape::If {
             cond,
             op,
+            value,
             target: None,
         }) => {
             let mut n = Stmt::new(K::If, id);
             n.expr = parse_expr(cond).ok();
             n.cc = Some(if op == "<>" { "<>" } else { "=" });
+            n.cmp = value.map(str::to_string);
             n.line = line;
             return Some(n);
         }
@@ -1278,7 +1307,7 @@ fn parse_stmt(s: &str, line: Option<u32>, ids: &mut Ids) -> Option<Stmt> {
             n.line = line;
             return Some(n);
         }
-        Some(Shape::ArrayDst(..)) | Some(Shape::LineMarker(_)) | Some(Shape::Banner) => {}
+        Some(Shape::ArrayDst { .. }) | Some(Shape::LineMarker(_)) | Some(Shape::Banner) => {}
         None => {}
     }
     // The block keywords carry no text of their own: what follows them in the
@@ -1295,9 +1324,11 @@ fn parse_stmt(s: &str, line: Option<u32>, ids: &mut Ids) -> Option<Stmt> {
         n.line = line;
         return Some(n);
     }
-    if s == "RETURN" {
+    if s == "RETURN" || s.starts_with("RETURN ") {
         let mut n = Stmt::new(K::Return, id);
         n.text = Some(s.to_string());
+        // the value is read here: it is what the caller receives in EAX
+        n.expr = s.strip_prefix("RETURN ").and_then(|v| parse_expr(v).ok());
         n.line = line;
         return Some(n);
     }
@@ -1322,9 +1353,11 @@ fn parse_stmt(s: &str, line: Option<u32>, ids: &mut Ids) -> Option<Stmt> {
     if let Some((lhs, rhs)) = split_assign(s) {
         let dst = lhs.trim().trim_end_matches('#').to_string();
         let mut didx = None;
+        let mut dfield = None;
         let dst = match patterns::shape(&dst) {
-            Some(Shape::ArrayDst(name, index)) => {
+            Some(Shape::ArrayDst { name, index, field }) => {
                 didx = parse_expr(index).ok();
+                dfield = field.map(str::to_string);
                 name.to_string()
             }
             _ => dst,
@@ -1332,6 +1365,7 @@ fn parse_stmt(s: &str, line: Option<u32>, ids: &mut Ids) -> Option<Stmt> {
         let mut n = Stmt::new(K::Assign, id);
         n.dst = Some(dst);
         n.didx = didx;
+        n.dfield = dfield;
         n.line = line;
         return match parse_expr(rhs) {
             Ok(e) => {
@@ -1711,280 +1745,360 @@ fn loop_counters(blk: &Block) -> BTreeSet<String> {
 }
 
 /// Occurrences of each variable that actually read it.
-#[allow(dead_code)]
 fn stmt_reads(n: &Stmt) -> BTreeSet<String> {
     let mut vs = vars_of(n.expr.as_ref());
     vs.extend(vars_of(n.didx.as_ref()));
     if n.kind == K::For {
         vs.extend(vars_of(n.lo.as_ref()));
         vs.extend(vars_of(n.hi.as_ref()));
+        vs.extend(vars_of(n.step.as_ref()));
     }
     vs
 }
 
-/// Every slot that any statement in the whole program reads.
-///
-/// A store whose destination is not in here cannot affect anything whatever
-/// the control flow does, so it is dead without the path scan having to
-/// succeed. The scan gives up -- conservatively, and correctly -- the moment it
-/// meets a goto it cannot resolve, and in a program full of jumps that means it
-/// proves very little on its own.
-fn read_anywhere(blk: &Block, tail: &[Stmt]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut stack: Vec<&Block> = vec![blk];
-    let add_tail = |out: &mut BTreeSet<String>| {
-        for n in tail {
-            out.extend(stmt_reads(n));
-        }
-    };
-    while let Some(cur) = stack.pop() {
-        for n in &cur.stmts {
-            out.extend(stmt_reads(n));
-            if n.kind == K::For
-                && let Some(v) = &n.var
-            {
-                out.insert(dst_base(v).to_string());
+// ================================================== liveness and dead stores
+
+/// One statement of the flattened control-flow graph.
+struct Node {
+    kind: K,
+    /// Variables read here.
+    reads: BTreeSet<String>,
+    /// Variables wholly overwritten here.
+    defs: BTreeSet<String>,
+    /// Successors, filled in while the graph is built.
+    succ: Vec<usize>,
+    /// Branch target, resolved once every label is known.
+    target: Option<String>,
+    /// The statement this node came from.
+    id: u32,
+    /// The store's destination, for the nodes that delete.
+    dst: Option<String>,
+    /// The statement's own text, for the nodes that name something.
+    text: Option<String>,
+    /// The statement's expression, for the calls it makes.
+    expr: Option<Expr>,
+    /// Removing this node cannot change what the program does.
+    removable: bool,
+}
+
+impl Node {
+    fn from_stmt(s: &Stmt) -> Self {
+        let mut defs = BTreeSet::new();
+        let mut removable = false;
+        match s.kind {
+            K::Assign => {
+                // a store into `arr(i)` or a bracket target is not a whole
+                // overwrite of anything
+                if s.didx.is_none()
+                    && let Some(d) = &s.dst
+                    && !d.starts_with('[')
+                {
+                    defs.insert(dst_base(d).to_string());
+                    removable = true;
+                }
             }
-            for b in [&n.body, &n.els].into_iter().flatten() {
-                stack.push(b);
+            K::For => {
+                if let Some(v) = &s.var {
+                    defs.insert(dst_base(v).to_string());
+                }
+            }
+            _ => {}
+        }
+        Self {
+            kind: s.kind,
+            reads: stmt_reads(s),
+            defs,
+            succ: Vec::new(),
+            target: s.target.clone(),
+            id: s.id,
+            dst: s.dst.clone(),
+            text: s.text.clone(),
+            expr: s.expr.clone(),
+            removable,
+        }
+    }
+}
+
+/// Flatten the block tree into a control-flow graph.
+///
+/// The tree already carries the structure -- an `IF` node owns its branches, a
+/// loop node owns its body -- so the edges come straight out of it: every
+/// statement falls through to the next one, a branch adds its target, and the
+/// last statement of a body falls through to whatever follows the whole
+/// construct. That is exactly the graph a `GOTO`-based liveness analysis needs,
+/// and it does not have to guess at block boundaries the way a linear scan did.
+fn graph(blk: &Block) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    let mut labels: HashMap<String, usize> = HashMap::new();
+    let (_entry, _exits) = build_graph(blk, &mut nodes, &mut labels);
+    for n in &mut nodes {
+        if matches!(n.kind, K::Jump | K::IfGoto)
+            && let Some(j) = n.target.as_ref().and_then(|t| labels.get(t)).copied()
+        {
+            n.succ.push(j);
+        }
+    }
+
+    // A call can read and write anything the callee does, and the callee's
+    // body is not reachable by fallthrough, so the graph needs an edge from
+    // each call site to the function it names. Without it a global written in
+    // the main program and read only inside a function would look dead.
+    let mut funcs: HashMap<String, usize> = HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if n.kind == K::Func
+            && let Some(name) = n.text.as_deref().and_then(|t| t.split_whitespace().nth(1))
+        {
+            funcs.insert(name.to_string(), i);
+        }
+    }
+    if !funcs.is_empty() {
+        let mut calls: Vec<(usize, Vec<String>)> = Vec::new();
+        for (i, n) in nodes.iter().enumerate() {
+            let mut names: Vec<String> = Vec::new();
+            called_names(n.expr.as_ref(), &mut |name| names.push(name.to_string()));
+            if let Some(t) = n.text.as_deref()
+                && let Some(rest) = t.split_once("CALL ").map(|(_, r)| r)
+                && let Some((name, _)) = rest.split_once('(')
+                && !name.is_empty()
+            {
+                names.push(name.trim().to_string());
+            }
+            if !names.is_empty() {
+                calls.push((i, names));
+            }
+        }
+        for (i, names) in calls {
+            for name in names {
+                if let Some(&f) = funcs.get(&name)
+                    && !nodes[i].succ.contains(&f)
+                {
+                    nodes[i].succ.push(f);
+                }
             }
         }
     }
-    add_tail(&mut out);
-    out
+    nodes
 }
 
-/// Is `name` read on a path that reaches from statement `i` onwards?
-///
-/// Follows forward jumps to their label rather than treating them as reads:
-/// `IF c THEN ... GOTO skip ... skip:` never touches the statements it skips.
-/// A backward jump, a conditional branch or an unknown target stops the scan,
-/// because then any later read may still be reached.
-fn scan_forward(
+/// Every function name a call expression names.
+fn called_names(e: Option<&Expr>, f: &mut impl FnMut(&str)) {
+    let Some(e) = e else { return };
+    match e {
+        Expr::Call(n, args) => {
+            f(n);
+            for a in args {
+                called_names(Some(a), f);
+            }
+        }
+        Expr::Arr(b, i) => {
+            called_names(Some(b), f);
+            called_names(Some(i), f);
+        }
+        Expr::Fld(b, _) => called_names(Some(b), f),
+        Expr::Bin(_, l, r) => {
+            called_names(Some(l), f);
+            called_names(Some(r), f);
+        }
+        Expr::Un(_, x) => called_names(Some(x), f),
+        _ => {}
+    }
+}
+
+/// Add one block to the graph, returning its entry node and the nodes whose
+/// successor is still to be decided (the block's exits).
+fn build_graph(
     blk: &Block,
-    i: usize,
-    name: &str,
-    seen: &mut HashSet<u32>,
-    tail: &[&Stmt],
-    labels: &HashMap<String, (u32, usize)>,
-) -> bool {
-    let list: Vec<&Stmt> = blk.stmts[i..].iter().collect();
-    scan_list(blk.id, &list, 0, name, seen, tail, labels)
+    nodes: &mut Vec<Node>,
+    labels: &mut HashMap<String, usize>,
+) -> (Option<usize>, Vec<usize>) {
+    let mut entry = None;
+    let mut exits: Vec<usize> = Vec::new();
+    for s in &blk.stmts {
+        let idx = nodes.len();
+        nodes.push(Node::from_stmt(s));
+        for e in exits.drain(..) {
+            nodes[e].succ.push(idx);
+        }
+        if entry.is_none() {
+            entry = Some(idx);
+        }
+        if s.kind == K::Label
+            && let Some(t) = &s.target
+        {
+            labels.entry(t.clone()).or_insert(idx);
+        }
+        match s.kind {
+            K::If => {
+                let mut fallthrough = false;
+                if let Some(b) = &s.body {
+                    let (be, bx) = build_graph(b, nodes, labels);
+                    match be {
+                        Some(be) => nodes[idx].succ.push(be),
+                        None => fallthrough = true,
+                    }
+                    exits.extend(bx);
+                } else {
+                    fallthrough = true;
+                }
+                if let Some(b) = &s.els {
+                    let (ee, ex) = build_graph(b, nodes, labels);
+                    match ee {
+                        Some(ee) => nodes[idx].succ.push(ee),
+                        None => fallthrough = true,
+                    }
+                    exits.extend(ex);
+                } else {
+                    fallthrough = true;
+                }
+                if fallthrough {
+                    exits.push(idx);
+                }
+            }
+            K::For | K::Do | K::Repeat => {
+                // the body runs, then the loop node again
+                if let Some(b) = &s.body {
+                    let (be, bx) = build_graph(b, nodes, labels);
+                    if let Some(be) = be {
+                        nodes[idx].succ.push(be);
+                    }
+                    for x in bx {
+                        nodes[x].succ.push(idx);
+                    }
+                }
+                exits.push(idx);
+            }
+            K::Func => {
+                // a function body is entered by its callers, not by the code
+                // in front of it; the caller edges are added once the names
+                // are known
+                if let Some(b) = &s.body {
+                    let (be, _bx) = build_graph(b, nodes, labels);
+                    if let Some(be) = be {
+                        nodes[idx].succ.push(be);
+                    }
+                }
+                // no fallthrough: the next statement is not part of this
+            }
+            K::Jump | K::Return | K::End | K::EndStmt => {
+                // `Jump` gets its only successor from the label table
+            }
+            _ => exits.push(idx),
+        }
+    }
+    (entry, exits)
 }
 
-/// Scan one statement list.
+/// Which nodes can be dropped as dead stores.
 ///
-/// `id` identifies the list, so a jump only resolves inside the very list it
-/// was written in; a freshly built list therefore treats its own labels as
-/// unreachable, which is the conservative answer.
-fn scan_list(
-    id: u32,
-    list: &[&Stmt],
-    i: usize,
-    name: &str,
-    seen: &mut HashSet<u32>,
-    tail: &[&Stmt],
-    labels: &HashMap<String, (u32, usize)>,
-) -> bool {
-    for n in list.iter().skip(i) {
-        if matches!(n.kind, K::Label | K::Return) {
+/// A store is dead when the destination is not live after it -- not read on any
+/// path before it is overwritten. The answer comes from a plain backward
+/// liveness analysis over the flattened graph, so a loop, a backward `GOTO` or
+/// a branch the decompiler could not structure costs nothing: the graph already
+/// has those edges. A store with a side effect is dropped only when the inliner
+/// moved its value into the reader, so the call still runs exactly once.
+fn dead_ids(nodes: &[Node], moved: &HashSet<u32>, impure: &HashSet<u32>) -> HashSet<u32> {
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for n in nodes {
+        names.extend(n.reads.iter().map(String::as_str));
+        names.extend(n.defs.iter().map(String::as_str));
+    }
+    let bit: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    let words = names.len().div_ceil(64);
+    let mask = |set: &BTreeSet<String>| -> Vec<u64> {
+        let mut m = vec![0u64; words];
+        for v in set {
+            if let Some(&b) = bit.get(v.as_str()) {
+                m[b / 64] |= 1 << (b % 64);
+            }
+        }
+        m
+    };
+    let reads: Vec<Vec<u64>> = nodes.iter().map(|n| mask(&n.reads)).collect();
+    let defs: Vec<Vec<u64>> = nodes.iter().map(|n| mask(&n.defs)).collect();
+
+    let mut live: Vec<Vec<u64>> = vec![vec![0u64; words]; nodes.len()];
+    loop {
+        let mut changed = false;
+        for i in (0..nodes.len()).rev() {
+            let mut set = vec![0u64; words];
+            for &s in &nodes[i].succ {
+                for (w, v) in live[s].iter().enumerate() {
+                    set[w] |= v;
+                }
+            }
+            // a region we cannot read may use anything it likes
+            if nodes[i].kind == K::Gap {
+                set.iter_mut().for_each(|w| *w = u64::MAX);
+            }
+            for (w, d) in defs[i].iter().enumerate() {
+                set[w] &= !d;
+            }
+            for (w, r) in reads[i].iter().enumerate() {
+                set[w] |= r;
+            }
+            if set != live[i] {
+                live[i] = set;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let live_at = |i: usize, name: &str| -> bool {
+        let Some(&b) = bit.get(name) else {
+            return false;
+        };
+        nodes[i].succ.iter().any(|&s| live[s][b / 64] & (1 << (b % 64)) != 0)
+    };
+
+    let mut out = HashSet::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if !n.removable {
             continue;
         }
-        if n.kind == K::IfGoto {
-            // both edges are possible: the jump when taken, the fall-through
-            // otherwise
-            if let Some(t) = &n.target
-                && let Some(&(bid, k)) = labels.get(t)
-                && bid == id
-                && k > i
-                && !seen.contains(&id)
-            {
-                seen.insert(id);
-                let hit = scan_list(id, list, k, name, seen, tail, labels);
-                seen.remove(&id);
-                if hit {
-                    return true;
-                }
-            }
-            return scan_list(id, list, i + 1, name, seen, tail, labels);
+        let Some(dst) = &n.dst else { continue };
+        let base = dst_base(dst);
+        // a call's value may move, but only if the inliner moved it
+        if impure.contains(&n.id) && !moved.contains(&n.id) {
+            continue;
         }
-        if n.kind == K::Jump {
-            match n.target.as_ref().and_then(|t| labels.get(t)) {
-                Some(&(bid, k)) if bid == id && k > i && !seen.contains(&id) => {
-                    seen.insert(id);
-                    let hit = scan_list(id, list, k, name, seen, tail, labels);
-                    seen.remove(&id);
-                    if hit {
-                        return true;
-                    }
-                    break;
-                }
-                _ => return true, // backward or unresolved
-            }
-        }
-        if n.kind == K::Assign && n.dst.as_deref().is_some_and(|d| dst_base(d) == name) {
-            return false; // overwritten first
-        }
-        if n.kind == K::For && n.var.as_deref() == Some(name) {
-            return true;
-        }
-        if stmt_reads_name(n, name) {
-            return true;
-        }
-        for b in [&n.body, &n.els].into_iter().flatten() {
-            let inner: Vec<&Stmt> = b.stmts.iter().collect();
-            if scan_list(b.id, &inner, 0, name, seen, &[], labels) {
-                return true;
-            }
-        }
-    }
-    // the code after this list
-    if !tail.is_empty() {
-        let id = fresh_list_id();
-        return scan_list(id, tail, 0, name, seen, &[], labels);
-    }
-    false
-}
-
-/// Does this statement read `name`? Allocation-free, unlike [`stmt_reads`].
-fn stmt_reads_name(n: &Stmt, name: &str) -> bool {
-    let e = |x: &Option<Expr>| x.as_ref().is_some_and(|e| mentions(e, name));
-    e(&n.expr) || e(&n.didx) || (n.kind == K::For && (e(&n.lo) || e(&n.hi)))
-}
-
-/// A list identity no real block can have, for the throwaway lists the scan
-/// builds.
-fn fresh_list_id() -> u32 {
-    use std::cell::Cell;
-    thread_local! {
-        static NEXT: Cell<u32> = const { Cell::new(u32::MAX / 2) };
-    }
-    NEXT.with(|n| {
-        let v = n.get().wrapping_add(1);
-        n.set(v);
-        v
-    })
-}
-
-/// Is the value stored at `idx` read before it is overwritten?
-fn read_before_write(
-    blk: &Block,
-    idx: usize,
-    tail: &[&Stmt],
-    labels: &HashMap<String, (u32, usize)>,
-) -> bool {
-    let Some(name) = blk.stmts[idx].dst.as_deref() else {
-        return false;
-    };
-    let name = dst_base(name);
-    let mut seen = HashSet::new();
-    scan_forward(blk, idx + 1, name, &mut seen, tail, labels)
-}
-
-/// Label positions across a statement list and everything nested in it, so a
-/// jump into a loop body still resolves.
-fn collect_labels(blk: &Block, tail: &[&Stmt]) -> HashMap<String, (u32, usize)> {
-    /// The identity of the throwaway copy `collect_labels` registers the
-    /// block's *own* labels under. A label at the top of a list is therefore
-    /// never resolvable by a scan of that same list -- which is what decides
-    /// whether a jump forward past a label stops the scan or continues past
-    /// it. Labels in nested blocks keep their own identity and do resolve.
-    const TOP_LEVEL: u32 = u32::MAX;
-
-    let mut out: HashMap<String, (u32, usize)> = HashMap::new();
-    let mut stack = vec![blk];
-    while let Some(cur) = stack.pop() {
-        for (k, n) in cur.stmts.iter().enumerate() {
-            if n.kind == K::Label
-                && let Some(t) = &n.target
-            {
-                out.entry(t.clone()).or_insert((TOP_LEVEL, k));
-            }
-            for b in [&n.body, &n.els].into_iter().flatten() {
-                stack.push(b);
-            }
-        }
-    }
-    for n in tail {
-        if n.kind == K::Label
-            && let Some(t) = &n.target
-        {
-            out.entry(t.clone()).or_insert((0, 0));
+        if !live_at(i, dst) && !live_at(i, base) {
+            out.insert(n.id);
         }
     }
     out
 }
 
-/// Delete `dst = expr` when nothing reads `dst` before it is rewritten.
-///
-/// The question is per straight-line region, not per file: a slot that is used
-/// later still says nothing about this store. `tail` carries the statements
-/// that follow the enclosing block, so a store inside an IF body is judged
-/// against what the code does after the IF as well. A store with a side effect
-/// is only dropped when the inliner moved the value into its reader, so the
-/// call still happens exactly once.
-///
-/// An unresolved goto stops the path scan, and in a program full of jumps that
-/// stops it early, so the test falls back to `alive`: a slot that no statement
-/// in the program reads is dead whatever the control flow does.
-fn dead_stores(
-    blk: &mut Block,
-    tail: &[&Stmt],
-    returns: &BTreeSet<String>,
-    alive: &BTreeSet<String>,
-    moved: &HashSet<u32>,
-) -> Block {
-    // One label map for the whole block: the scan for every statement in it
-    // resolves the same jumps.
-    let labels = collect_labels(blk, tail);
+/// Drop every statement whose id is in `dead`.
+fn remove_ids(blk: &Block, dead: &HashSet<u32>) -> Block {
     let mut out = Block {
         id: blk.id,
         stmts: Vec::with_capacity(blk.stmts.len()),
     };
-    for idx in 0..blk.stmts.len() {
-        let mut n = blk.stmts[idx].clone();
-        let mut rest: Vec<&Stmt> = blk.stmts[idx + 1..].iter().collect();
-        rest.extend_from_slice(tail);
-        if let Some(b) = &mut n.body {
-            n.body = Some(dead_stores(b, &rest, returns, alive, moved));
+    for n in &blk.stmts {
+        if dead.contains(&n.id) {
+            continue;
         }
-        if let Some(b) = &mut n.els {
-            n.els = Some(dead_stores(b, &rest, returns, alive, moved));
+        let mut n = n.clone();
+        if let Some(b) = &n.body {
+            n.body = Some(remove_ids(b, dead));
         }
-        let dst = n.dst.clone();
-        let drop = n.kind == K::Assign
-            && dst.as_deref().is_some_and(|d| !d.starts_with('['))
-            && n.didx.is_none()
-            && !returns.contains(dst.as_deref().unwrap_or(""))
-            && (n.expr.as_ref().is_some_and(is_pure) || moved.contains(&n.id))
-            && (!read_before_write(blk, idx, tail, &labels)
-                || !alive.contains(dst_base(dst.as_deref().unwrap_or(""))));
-        if !drop {
-            out.stmts.push(n);
+        if let Some(b) = &n.els {
+            n.els = Some(remove_ids(b, dead));
         }
+        out.stmts.push(n);
     }
     out
 }
 
-/// A FUNCTION's result is the frame slot the caller reads back; nothing in the
-/// body reads it, so its stores must never be treated as dead.
-fn return_slots(blk: &Block) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+/// Statements whose value is a call that must not be duplicated or moved.
+fn impure_ids(blk: &Block) -> HashSet<u32> {
+    let mut out = HashSet::new();
     walk(blk, &mut |n| {
-        if n.kind == K::Func
-            && let Some(body) = &n.body
-        {
-            for s in &body.stmts {
-                if s.kind == K::Assign
-                    && let Some(d) = &s.dst
-                    && d.starts_with("loc")
-                {
-                    out.insert(d.clone());
-                }
-            }
-            // only the slot the prologue zeroes and the epilogue returns is
-            // the result; the compiler names it loc-8
-            out.insert("loc-8".to_string());
+        if n.kind == K::Assign && n.expr.as_ref().is_some_and(|e| !is_pure(e)) {
+            out.insert(n.id);
         }
     });
     out
@@ -2835,7 +2949,11 @@ fn emit(blk: &Block, out: &mut Vec<String>, depth: usize) {
         match n.kind {
             // the block headers emit their own ENDIF / NEXT / LOOP
             K::Next | K::Loop | K::EndIf => {}
-            K::Nop | K::Comment | K::Stmt | K::EndFunc | K::Return => {
+            K::Return => match &n.expr {
+                Some(e) => out.push(format!("{ind}RETURN {}", render(e))),
+                None => out.push(format!("{ind}RETURN")),
+            },
+            K::Nop | K::Comment | K::Stmt | K::EndFunc => {
                 if let Some(t) = &n.text {
                     out.push(format!("{ind}{t}"));
                 }
@@ -2850,10 +2968,16 @@ fn emit(blk: &Block, out: &mut Vec<String>, depth: usize) {
             K::Jump => out.push(format!("{ind}GOTO {}", n.target.as_deref().unwrap_or(""))),
             K::End | K::EndStmt => out.push(format!("{ind}END")),
             K::IfGoto => {
+                let test = render(n.expr.as_ref().unwrap_or(&Expr::Num(Num::Int(0))));
+                let cond = match &n.cmp {
+                    Some(v) => format!(
+                        "{test} {} {v}",
+                        if n.cc == Some("<>") { "<>" } else { "=" }
+                    ),
+                    None => format!("{test}{}", cc_suffix(n.cc)),
+                };
                 out.push(format!(
-                    "{ind}IF {}{} THEN GOTO {}",
-                    render(n.expr.as_ref().unwrap_or(&Expr::Num(Num::Int(0)))),
-                    cc_suffix(n.cc),
+                    "{ind}IF {cond} THEN GOTO {}",
                     n.target.as_deref().unwrap_or("")
                 ));
             }
@@ -2929,7 +3053,12 @@ fn emit(blk: &Block, out: &mut Vec<String>, depth: usize) {
             K::Assign => {
                 let lhs = match &n.didx {
                     None => n.dst.clone().unwrap_or_default(),
-                    Some(i) => format!("{}({})", n.dst.as_deref().unwrap_or(""), render(i)),
+                    Some(i) => format!(
+                        "{}({}){}",
+                        n.dst.as_deref().unwrap_or(""),
+                        render(i),
+                        n.dfield.as_deref().unwrap_or("")
+                    ),
                 };
                 out.push(format!(
                     "{ind}{lhs} = {}",
@@ -2956,7 +3085,8 @@ fn cc_suffix(cc: Option<&str>) -> &'static str {
 
 /// Rewrite `transcription` into readable BASIC, returning the lines and the
 /// legend of inferred names.
-pub fn tidy(transcription: &str) -> (Vec<String>, Legend) {
+/// `prog_end` is the label of the program epilogue -- `JMP` there is `END`.
+pub fn tidy(transcription: &str, prog_end: Option<&str>) -> (Vec<String>, Legend) {
     let lines: Vec<String> = transcription.split('\n').map(str::to_string).collect();
     let mut ids = Ids::default();
     let mut nodes = parse_block(&lines, &mut ids);
@@ -2965,27 +3095,27 @@ pub fn tidy(transcription: &str) -> (Vec<String>, Legend) {
 
     let loops = loop_counters(&nodes);
     let mut moved: HashSet<u32> = HashSet::new();
-    for _ in 0..6 {
+    for _ in 0..12 {
         let mut inl = Inliner::new(loops.clone());
         inl.block(&mut nodes);
         moved.extend(inl.moved.iter().copied());
         fold_all(&mut nodes);
-        let returns = return_slots(&nodes);
-        let alive = read_anywhere(&nodes, &[]);
-        nodes = dead_stores(&mut nodes, &[], &returns, &alive, &moved);
+        let impure = impure_ids(&nodes);
+        let dead = dead_ids(&graph(&nodes), &moved, &impure);
+        nodes = remove_ids(&nodes, &dead);
     }
 
     fold_test_chains(&mut nodes);
     nodes = constant_conditions(&nodes);
     nodes = drop_epilogue(&nodes);
     nodes = fold_forward_gotos(&nodes, &mut ids);
-    flow_fixes(&mut nodes, PROG_END);
+    flow_fixes(&mut nodes, prog_end.unwrap_or(""));
     fold_all(&mut nodes); // the swapped branches changed shape
     fold_test_chains(&mut nodes);
     nodes = constant_conditions(&nodes);
-    let returns = return_slots(&nodes);
-    let alive = read_anywhere(&nodes, &[]);
-    nodes = dead_stores(&mut nodes, &[], &returns, &alive, &moved);
+    let impure = impure_ids(&nodes);
+    let dead = dead_ids(&graph(&nodes), &moved, &impure);
+    nodes = remove_ids(&nodes, &dead);
 
     let (gtab, tables, legend) = naming(&nodes);
     mark_inits(&mut nodes);
@@ -3094,7 +3224,7 @@ mod tests {
     #[test]
     fn the_loop_seed_goes_and_the_loop_stays() {
         let src = "n4 = 5 - 1\nFOR n4 = 5 TO 9\n  n8 = n4 * 2\nNEXT n4\n";
-        let (out, _) = tidy(src);
+        let (out, _) = tidy(src, None);
         let text = out.join("\n");
         assert!(text.contains("FOR n4 = 5 TO 9"), "{text}");
         assert!(text.contains("NEXT n4"), "{text}");

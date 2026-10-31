@@ -112,6 +112,18 @@ const CMPOPS: &[(&str, &str)] = &[
 /// An expression result together with the instruction index that follows it.
 type Expr = (String, usize);
 
+/// The element load an array access starts with, and where its error block is.
+struct Access {
+    /// The array's name.
+    arr: String,
+    /// The index the `MOV EBX` loads.
+    idx: String,
+    /// Instruction index of the `MOV EAX,[EAX+EBX*4]` element load.
+    elem: usize,
+    /// Instruction index the bounds failure jumps to.
+    err: usize,
+}
+
 /// The decompiler.
 pub struct Dec<'a> {
     pub prog: &'a Prog,
@@ -120,10 +132,14 @@ pub struct Dec<'a> {
     varnames: HashMap<u32, String>,
     /// Statements in address order.
     pub statements: Vec<Stmt>,
+    /// User function entry address -> the name the blob records.
+    fnames: HashMap<u32, String>,
     /// Branch target address -> label name.
     labels: HashMap<u32, String>,
     /// Statement index -> the index whose address is its branch target.
     by_addr: HashMap<u32, usize>,
+    /// Instruction address -> instruction index.
+    addr_index: HashMap<u32, usize>,
     /// Target that starts no statement -> the statement it snaps to.
     snap: HashMap<u32, Option<usize>>,
     /// Statement index -> the back edge that closes its loop.
@@ -132,10 +148,21 @@ pub struct Dec<'a> {
     consumed_labels: HashSet<u32>,
     /// Undecoded regions.
     pub gaps: usize,
+    /// Address of the program epilogue (the final break-out check), when seen.
+    pub epilogue: Option<u32>,
+    /// Array name -> the element field offsets the code reads or writes.
+    pub array_fields: HashMap<String, BTreeSet<u32>>,
     /// Per-run counters.
     pub stats: Stats,
     /// Text of the value currently live in EAX.
     eax: Option<String>,
+    /// Labels a structured block swallowed but another branch still names.
+    forced_labels: HashSet<String>,
+    /// Labels already printed in this pass.
+    printed: HashSet<u32>,
+    /// Position whose subscript is being parsed, if any.  Stops the expression
+    /// parser from re-entering the array-access parser at that same position.
+    subscript_at: Option<usize>,
 }
 
 /// The index one past the statement at `k`.
@@ -162,14 +189,26 @@ impl<'a> Dec<'a> {
             n: prog.ins.len(),
             varnames: HashMap::new(),
             statements: Vec::new(),
+            fnames: HashMap::new(),
             labels: HashMap::new(),
             by_addr: HashMap::new(),
+            addr_index: prog
+                .ins
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (x.addr, i))
+                .collect(),
             snap: HashMap::new(),
             loophead: HashMap::new(),
             consumed_labels: HashSet::new(),
             gaps: 0,
+            epilogue: None,
+            array_fields: HashMap::new(),
             stats: Stats::default(),
             eax: None,
+            subscript_at: None,
+            forced_labels: HashSet::new(),
+            printed: HashSet::new(),
         }
     }
 
@@ -208,8 +247,42 @@ impl<'a> Dec<'a> {
         }
     }
 
-    fn funcname(addr: u32) -> String {
-        format!("FUNC_{:X}", addr)
+    /// The name the blob gives the function at `addr`, or its address.
+    fn funcname(&self, addr: u32) -> String {
+        self.fnames
+            .get(&addr)
+            .cloned()
+            .unwrap_or_else(|| format!("FUNC_{:X}", addr))
+    }
+
+    /// The user-function names the blob records, keyed by entry address.
+    pub fn name_functions(&mut self, names: HashMap<u32, String>) {
+        self.fnames = names;
+    }
+
+    /// Every user function's entry address and its parameter count, in
+    /// address (= source) order.
+    ///
+    /// The parameter count comes from the calls: the compiler pushes one
+    /// argument per parameter, so a call site states it exactly.
+    pub fn functions(&self) -> Vec<(u32, usize)> {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        for s in &self.statements {
+            if s.kind != Kind::Funcall {
+                continue;
+            }
+            let Some((args, _)) = &s.extra else { continue };
+            let Some(addr) = s.target else { continue };
+            counts
+                .entry(addr)
+                .and_modify(|n| *n = (*n).max(args.len()))
+                .or_insert(args.len());
+        }
+        self.statements
+            .iter()
+            .filter(|s| s.kind == Kind::Func)
+            .map(|s| (s.addr, counts.get(&s.addr).copied().unwrap_or(0)))
+            .collect()
     }
 
     /// Interpret a 32-bit operand as a signed displacement.
@@ -218,6 +291,16 @@ impl<'a> Dec<'a> {
             v - 0x1_0000_0000
         } else {
             v
+        }
+    }
+
+    /// The immediate of instruction `k`'s second operand, when it has one.
+    fn second_imm(&self, k: usize) -> Option<u32> {
+        let x = self.ins.get(k)?;
+        match x.reference2 {
+            Some(r) if r.kind == ref_type::IMMEDIATE => Some(r.index),
+            Some(_) => None,
+            None => x.raw2,
         }
     }
 
@@ -272,12 +355,70 @@ impl<'a> Dec<'a> {
         }
     }
 
+    /// The index of the instruction at `addr`, when one starts there.
+    fn index_at(&self, addr: u32) -> Option<usize> {
+        self.addr_index.get(&addr).copied()
+    }
+
+    /// Where a compiler-internal branch goes.
+    ///
+    /// The compiler's own jumps -- the array checks, the DIV guard, the leap
+    /// markers (`WriteASMLeapMarkerJump`) -- carry their distance as an
+    /// immediate reference (kind `IMMEDIATE`, the finished rel32). A source
+    /// `IF`/`GOTO` carries a `LABEL` reference instead, which the loader turns
+    /// into the same kind of displacement. The reference *kind* is what
+    /// separates scaffolding from a branch the programmer wrote.
+    fn internal_jump(&self, k: usize) -> Option<u32> {
+        let x = self.ins.get(k)?;
+        match x.reference {
+            Some(r) if r.kind == ref_type::IMMEDIATE => {
+                Some((x.addr + x.size).wrapping_add(r.index))
+            }
+            None => {
+                let rel = x.raw? as i32;
+                Some((x.addr + x.size).wrapping_add(rel as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// The instruction a compiler-internal branch lands on.
+    fn internal_target(&self, k: usize) -> Option<usize> {
+        self.index_at(self.internal_jump(k)?)
+    }
+
+    /// A compiler null-check: `<load array>; CMP EAX,0; JE <skip>`.
+    ///
+    /// This is how the array code guards every element access when safe arrays
+    /// are on (`GetArrayCheckFlag`): the guarded run only runs when the array
+    /// pointer exists. Returns the array's name and the instruction the guard
+    /// jumps to.
+    fn null_guard(&mut self, k: usize) -> Option<(String, usize)> {
+        let arr = match self.name_at(k) {
+            "MOV EAX MEM4" => self.varname(self.ref_kind(k, ref_type::VARIABLE)?),
+            "MOV EAX4 [EBP+A]" => Self::ebpname(self.imm(k)?),
+            _ => return None,
+        };
+        if !(self.is(k + 1, "CMP EAX4") && self.imm(k + 1) == Some(0) && self.is(k + 2, "JE")) {
+            return None;
+        }
+        Some((arr, self.internal_target(k + 2)?))
+    }
+
     // ----------------------------------------------------------- expressions
 
     /// `... -> EAX`.
     fn load(&mut self, k: usize) -> Option<Expr> {
         let x = self.ins.get(k)?;
         let nm = x.name;
+        // An array element is a value like any other: the whole access (with
+        // its subscript calculation in front) or just the access itself, when
+        // the subscript's temporary was stored by an earlier statement.
+        if self.subscript_at != Some(k)
+            && let Some(e) = self.array_expr(k).or_else(|| self.access_read(k, None))
+        {
+            return Some(e);
+        }
         if matches!(nm, "MOV EAX IMM1" | "MOV EAX IMM2" | "MOV EAX IMM4") {
             let Some(r) = x.reference else {
                 return Some((format!("{}", self.imm(k)?), k + 1));
@@ -320,13 +461,21 @@ impl<'a> Dec<'a> {
         }
         // A 64-bit value is loaded as its low half then its high half.
         if nm == "MOV EDX IMM4"
-            && x.reference.is_none()
-            && let Some(d) = self.imm(k)
+            && matches!(
+                x.reference.map(|r| r.kind),
+                None | Some(ref_type::IMMEDIATE)
+            )
+            && let Some(hi) = self.imm(k)
             && self.is(k + 1, "MOV EAX IMM4")
-            && self.ins[k + 1].reference.is_none()
+            && matches!(
+                self.ins[k + 1].reference.map(|r| r.kind),
+                None | Some(ref_type::IMMEDIATE)
+            )
             && let Some(lo) = self.imm(k + 1)
         {
-            return Some((format!("{{{lo},{d}}}"), k + 2));
+            // a 64-bit (double integer) literal: the compiler splits it into
+            // its low dword in EAX and its high dword in EDX
+            return Some((format!("{{{lo},{hi}}}"), k + 2));
         }
         if nm == "MOV ECX IMM4"
             && let Some(i) = self.ref_kind(k, ref_type::VARIABLE)
@@ -499,9 +648,14 @@ impl<'a> Dec<'a> {
             }
             return None;
         }
-        if nm.starts_with("IDIV EAX EBX") {
+        if nm.starts_with("IDIV EAX EBX") || (nm == "CMP EBX4" && self.imm(j) == Some(0)) {
             let j2 = self.divblock(j)?;
-            return Some((format!("{left_text} / {right_text}"), j2));
+            let op = if self.name_at(j2 - 1).starts_with("MOV EAX EDX") {
+                "MOD"
+            } else {
+                "/"
+            };
+            return Some((format!("{left_text} {op} {right_text}"), j2));
         }
         None
     }
@@ -572,6 +726,15 @@ impl<'a> Dec<'a> {
                     args.push(e.0);
                     j = e.1 + 1;
                 }
+                // a 64-bit literal is pushed as its high dword, then its low
+                Some(e)
+                    if e.0.starts_with('{')
+                        && self.is(e.1, "PUSH EDX")
+                        && self.is(e.1 + 1, "PUSH EAX") =>
+                {
+                    args.push(e.0);
+                    j = e.1 + 2;
+                }
                 // an 8-byte value already in ST0 pushes as two dwords
                 Some(e) if e.0.ends_with('#') => match self.push_double(e.1) {
                     Some(pd) => {
@@ -624,7 +787,7 @@ impl<'a> Dec<'a> {
             {
                 j += 3;
             }
-            s.end = self.endof(j);
+            s.end = self.endof(j - 1);
             self.push_stmt(s);
             return j;
         }
@@ -638,16 +801,23 @@ impl<'a> Dec<'a> {
     /// Every recogniser except [`Dec::st_gap`], in priority order.
     fn try_all(&mut self, k: usize) -> Option<usize> {
         self.st_frame(k)
+            .or_else(|| self.st_sync(k))
+            .or_else(|| self.st_array_read(k))
+            .or_else(|| self.st_array_write(k))
+            .or_else(|| self.st_arridx(k))
             .or_else(|| self.st_call(k))
-            .or_else(|| self.st_array(k))
-            .or_else(|| self.st_arrayload(k))
             .or_else(|| self.st_binop(k))
             .or_else(|| self.st_immediate_op(k))
             .or_else(|| self.st_assign(k))
             .or_else(|| self.st_condition(k))
             .or_else(|| self.st_funcall(k))
             .or_else(|| self.st_jump(k))
+            .or_else(|| self.st_double_imm(k))
+            .or_else(|| self.st_case(k))
+            .or_else(|| self.st_incdec(k))
+            .or_else(|| self.st_break_check(k))
             .or_else(|| self.st_misc(k))
+            .or_else(|| self.st_return_value(k))
             .or_else(|| self.st_arrayerr(k))
     }
 
@@ -779,12 +949,67 @@ impl<'a> Dec<'a> {
 
         args.reverse();
         let call = format!("{name}({})", args.join(", "));
+        // A call whose result is written straight into an array element is one
+        // BASIC statement: `arr(i).f = NAME(...)`.
+        if ret.is_none()
+            && let Some((lhs, next)) = self.elem_store(j)
+        {
+            let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
+            s.text = Some(format!("{lhs} = {call}"));
+            s.end = self.endof(next - 1);
+            self.push_stmt(s);
+            self.stats.assign += 1;
+            self.stats.array += 1;
+            self.eax = None;
+            return Some(next);
+        }
         let mut s = Stmt::new(self.ins[k].addr, Kind::Call);
         s.text = Some(name);
         s.extra = Some((args, ret.clone()));
-        s.end = self.endof(j);
+        s.end = self.endof(j - 1);
         self.push_stmt(s);
         self.eax = ret.is_none().then_some(call);
+        Some(j)
+    }
+
+    /// `MOV ECX,EAX` + an element store: where a call's result lands.  The
+    /// call's own argument pops follow the store.
+    fn elem_store(&mut self, k: usize) -> Option<(String, usize)> {
+        if !self.is(k, "MOV ECX EAX") {
+            return None;
+        }
+        let (lhs, mut j) = self.access_write(k + 1, None)?;
+        while self.is(j, "POP EBX") || self.is(j, "POP EAX") {
+            j += 1;
+        }
+        Some((lhs, j))
+    }
+
+    /// `SYNC()` -- `BUILD_SYNC`: process messages and leave the program when
+    /// the runtime reports it was asked to quit.
+    ///
+    /// ```text
+    /// MOV EBX, cmd ProcessMessages
+    /// CALL EBX
+    /// CMP EAX,1
+    /// JE $labelend
+    /// ```
+    fn st_sync(&mut self, k: usize) -> Option<usize> {
+        let index = self.call_at(k)?;
+        if self.command_name(index) != "PROCESS MESSAGES" {
+            return None;
+        }
+        let mut j = k + 2;
+        if !(self.is(j, "CMP EAX4") && self.imm(j) == Some(1) && self.is(j + 1, "JE")) {
+            return None;
+        }
+        j += 2;
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Call);
+        s.text = Some("SYNC".to_string());
+        s.extra = Some((Vec::new(), None));
+        s.end = self.endof(j - 1);
+        self.push_stmt(s);
+        self.stats.cmd += 1;
         Some(j)
     }
 
@@ -811,7 +1036,7 @@ impl<'a> Dec<'a> {
             }
             let mut s = Stmt::new(self.ins[k].addr, Kind::Misc);
             s.text = Some("' [program start: PUSHAD, ESP saved]".to_string());
-            s.end = self.endof(j);
+            s.end = self.endof(j - 1);
             self.push_stmt(s);
             return Some(j);
         }
@@ -834,6 +1059,27 @@ impl<'a> Dec<'a> {
     fn store(&mut self, k: usize) -> Option<(String, usize)> {
         let x = self.ins.get(k)?;
         let nm = x.name;
+        // `MOV ECX,<variable>` loads the slot's *address* (ref type 3 patches
+        // `m_pVariableSpace+offset`), so a following `MOV [ECX+A],EAX` writes
+        // the variable at `offset + A` -- that is how a store to a user-type
+        // field or to an unaligned slot is spelled.
+        if nm == "MOV ECX IMM4"
+            && let Some(base) = self.ref_kind(k, ref_type::VARIABLE)
+            && matches!(
+                self.name_at(k + 1),
+                "MOV [ECX+A] EAX1" | "MOV [ECX+A] EAX2" | "MOV [ECX+A] EAX4"
+            )
+            && let Some(d) = self.imm(k + 1)
+        {
+            let name = self.varname(base);
+            let off = Self::sd(d);
+            let tgt = if off == 0 {
+                name
+            } else {
+                format!("{name}.{off}")
+            };
+            return Some((tgt, k + 2));
+        }
         if matches!(nm, "MOV MEM EAX1" | "MOV MEM EAX2" | "MOV MEM EAX4")
             && let Some(i) = self.ref_kind(k, ref_type::VARIABLE)
         {
@@ -893,7 +1139,7 @@ impl<'a> Dec<'a> {
         self.stats.assign += 1;
         let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
         s.text = Some(format!("{tgt} = {text}"));
-        s.end = self.endof(after);
+        s.end = self.endof(after - 1);
         self.push_stmt(s);
         self.eax = Some(text);
         Some(after)
@@ -937,7 +1183,7 @@ impl<'a> Dec<'a> {
         let (tgt, after) = self.store(j)?;
         let mut s = Stmt::new(addr, Kind::Assign);
         s.text = Some(format!("{tgt} = {left} {op} {right}"));
-        s.end = self.endof(after);
+        s.end = self.endof(after - 1);
         self.push_stmt(s);
         self.stats.assign += 1;
         Some(after)
@@ -950,7 +1196,7 @@ impl<'a> Dec<'a> {
         self.stats.assign += 1;
         let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
         s.text = Some(format!("{tgt} = {text}"));
-        s.end = self.endof(after);
+        s.end = self.endof(after - 1);
         self.push_stmt(s);
         self.eax = Some(text);
         Some(after)
@@ -978,146 +1224,31 @@ impl<'a> Dec<'a> {
         None
     }
 
-    /// `arr(index) = value`, with the compiler's array bounds check
-    /// (`WriteASMEAXtoX` / `WriteASMEAXtoARR`).
-    fn st_array(&mut self, k: usize) -> Option<usize> {
-        let (arr, idx, val, mut j) = if let Some(e) = self.expr(k)
-            && self.is(e.1, "PUSH EAX")
-        {
-            let j = e.1 + 1;
-            // A strict prefix: the array pointer load, the existence check
-            // and the subscript pop. Without this the loop-condition pattern
-            // is misread.
-            if !(self.is(j, "MOV EAX MEM4") && self.ref_kind(j, ref_type::VARIABLE).is_some()) {
-                return None;
-            }
-            let arr = self.varname(self.ins[j].reference?.index);
-            if !(self.is(j + 1, "CMP EAX4")
-                && self.imm(j + 1) == Some(0)
-                && self.is(j + 2, "JE")
-                && self.is(j + 3, "POP EBX"))
-            {
-                return None;
-            }
-            (arr, e.0, None, j + 4)
-        } else {
-            // The stored value may be a library command's return, which the
-            // expression parser cannot see; it is stashed with `MOV ECX,EAX`
-            // and written into the element by the `MOV [EAX+A] ECX` below.
-            let (v, mut j) = self.cmd_value(k)?;
-            if !self.is(j, "MOV ECX EAX") {
-                return None;
-            }
-            j += 1;
-            if !(self.is(j, "MOV EAX MEM4") && self.ref_kind(j, ref_type::VARIABLE).is_some()) {
-                return None;
-            }
-            let arr = self.varname(self.ins[j].reference?.index);
-            if !(self.is(j + 1, "CMP EAX4") && self.imm(j + 1) == Some(0) && self.is(j + 2, "JE")) {
-                return None;
-            }
-            j += 3;
-            let (idx, next) = self.array_index(j)?;
-            (arr, idx, Some(v), next)
-        };
-        let mut arr = Some(arr);
-        let idx = Some(idx);
-        let mut val = val;
+    // -------------------------------------------------------- array accesses
+    //
+    // With safe arrays on (`GetArrayCheckFlag`) the compiler brackets every
+    // element access with its own safety code: a null check on the array
+    // pointer, a bounds check against the element count at `[EAX-16]`, and an
+    // unreachable runtime-error block (118).  Every one of those jumps is a raw
+    // relative displacement (`WriteASMLeapMarkerJump`), which is what makes it
+    // distinguishable from a source-level `IF`, whose target is a reference-
+    // table label.
 
-        let limit = self.n.min(j + 36);
-        while j < limit {
-            let x = &self.ins[j];
-            let nm = x.name;
-            let var_ref = self.ref_kind(j, ref_type::VARIABLE);
-            if matches!(nm, "MOV EAX MEM4" | "MOV ECX MEM4" | "MOV EBX MEM4")
-                && nm == "MOV EAX MEM4"
-                && let Some(i) = var_ref
-            {
-                if arr.is_none() {
-                    arr = Some(self.varname(i));
-                } else if val.is_none() {
-                    val = Some(self.varname(i));
-                }
-            } else if nm == "MOV EAX SIB[EAX:EBX*4]" {
-                let (Some(arr), Some(idx), Some(val)) = (arr.clone(), idx.clone(), val.clone())
-                else {
-                    return None;
-                };
-                if !self.name_at(j + 1).starts_with("MOV [EAX+A] ECX") {
-                    return None;
-                }
-                let off = self.imm(j + 1).unwrap_or(0);
-                let suffix = if off == 0 {
-                    String::new()
-                } else {
-                    format!(".{}", Self::sd(off))
-                };
-                let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
-                s.text = Some(format!("{arr}({idx}){suffix} = {val}"));
-                let mut q = j + 2;
-                if self.is(q, "JMP") {
-                    q += 1;
-                }
-                s.end = self.endof(q);
-                self.push_stmt(s);
-                self.stats.assign += 1;
-                self.stats.array += 1;
-                return Some(q);
-            } else if nm == "MOV ECX EAX" {
-                // the value is already loaded into EAX
-            } else if matches!(nm, "MOV EAX IMM1" | "MOV EAX IMM2" | "MOV EAX IMM4")
-                && matches!(
-                    x.reference.map(|r| r.kind),
-                    None | Some(ref_type::IMMEDIATE)
-                )
-            {
-                val = self.imm(j).map(|v| v.to_string());
-            } else if matches!(
-                nm,
-                "MOV EAX1 [EBP+A]" | "MOV EAX2 [EBP+A]" | "MOV EAX4 [EBP+A]"
-            ) && let Some(d) = self.imm(j)
-            {
-                val = Some(Self::ebpname(d));
-            }
-            j += 1;
-        }
-        None
-    }
-
-    /// `arr(index).field` -- the read mirror of the store in [`Dec::st_array`].
+    /// The element load every access starts with.
     ///
-    /// A statement commonly saves a value before the read, so the walker is
-    /// rarely sitting on the array load itself; scan a short window for the
-    /// start of the shape and take the first that parses.
-    fn st_arrayload(&mut self, k: usize) -> Option<usize> {
-        (k..self.n.min(k + 8)).find_map(|s| self.arrayload_at(s, k))
-    }
-
-    /// Parse the array-of-user-types read starting exactly at `k`.
+    /// `CalculateArrayOffsetInEBX` + `MOV EAX,[EAX+EBX*4]`:
     ///
     /// ```text
-    /// MOV EAX, @arr   CMP EAX,0      JE <error>
-    /// MOV EBX, <index>
-    /// PUSH EDX   MOV EDX,[EAX-16]  CMP EDX,EBX  POP EDX  JGE <error>
-    /// CMP EBX,-1  JLE <error>
-    /// MOV EAX,[EAX+EBX*4]          -- the element
-    /// MOV ECX,[EAX+off]   MOV EAX,ECX
+    /// MOV EAX,<array>   CMP EAX,0   JE <error>
+    /// MOV EBX,<index>
+    /// PUSH EDX  MOV EDX,[EAX-16]  CMP EDX,EBX  POP EDX  JGE <error>
+    /// CMP EBX,-1   JLE <error>
+    /// MOV EAX,[EAX+EBX*4]
     /// ```
-    fn arrayload_at(&mut self, k: usize, start: usize) -> Option<usize> {
-        if !(self.is(k, "MOV EAX MEM4") && self.ref_kind(k, ref_type::VARIABLE).is_some()) {
-            return None;
-        }
-        let arr = self.varname(self.ins[k].reference?.index);
-        let mut j = k + 1;
-        if !(self.is(j, "CMP EAX4") && self.imm(j) == Some(0) && self.is(j + 1, "JE")) {
-            return None;
-        }
-        j += 2;
-        let (idx, next) = self.array_index(j)?;
-        j = next;
-        // The bounds check the compiler wraps around every array subscript:
-        // [EAX-16] holds the element count and -1 is the lowest legal index.
-        let bounds = self.is(j, "PUSH EDX")
+    fn access_head(&mut self, k: usize) -> Option<Access> {
+        let (arr, err) = self.null_guard(k)?;
+        let (idx, mut j) = self.array_index(k + 3)?;
+        if self.is(j, "PUSH EDX")
             && self.is(j + 1, "MOV EDX4 [EAX+A]")
             && self.imm(j + 1).is_some_and(|d| Self::sd(d) == -16)
             && self.is(j + 2, "CMP EDX EBX4")
@@ -1125,44 +1256,227 @@ impl<'a> Dec<'a> {
             && self.is(j + 4, "JGE")
             && self.is(j + 5, "CMP EBX4")
             && self.imm(j + 5).is_some_and(|d| Self::sd(d) == -1)
-            && self.is(j + 6, "JLE");
-        if bounds {
+            && self.is(j + 6, "JLE")
+            && self.internal_target(j + 4) == Some(err)
+            && self.internal_target(j + 6) == Some(err)
+        {
             j += 7;
         }
         if !self.is(j, "MOV EAX SIB[EAX:EBX*4]") {
             return None;
         }
-        j += 1;
+        Some(Access {
+            arr,
+            idx,
+            elem: j,
+            err,
+        })
+    }
+
+    /// Is `k` the unreachable `MOV [@_ERR_],118` of an array bounds failure?
+    fn err_block_at(&self, k: usize) -> bool {
+        self.is(k, "MOV MEM IMM4")
+            && self.ref_is(k, ref_type::VARIABLE, 4)
+            && self.second_imm(k) == Some(118)
+    }
+
+    /// `arr(idx).field` read: everything from the element load to the jump that
+    /// steps over the error block.  `idx` overrides the loaded index when the
+    /// caller already has the subscript text.
+    fn access_read(&mut self, k: usize, idx: Option<&str>) -> Option<Expr> {
+        let a = self.access_head(k)?;
+        let mut j = a.elem + 1;
         let off;
-        if self.is(j, "MOV ECX4 [EAX+A]") {
+        if matches!(self.name_at(j), "MOV ECX4 [EAX+A]" | "MOV ECX1 [EAX+A]") {
             off = self.imm(j)?;
-            j += 1;
-            if !self.is(j, "MOV EAX ECX4") {
+            if !matches!(self.name_at(j + 1), "MOV EAX ECX4" | "MOV EAX ECX1") {
                 return None;
             }
-            j += 1;
+            j += 2;
         } else if matches!(
             self.name_at(j),
             "MOV EAX1 [EAX+A]" | "MOV EAX2 [EAX+A]" | "MOV EAX4 [EAX+A]"
         ) {
             off = self.imm(j)?;
             j += 1;
+        } else if matches!(self.name_at(j), "ADD EAX IMM1" | "ADD EAX IMM2" | "ADD EAX IMM4") {
+            // a user-type array element is a pointer, offset by the field
+            off = self.imm(j)?;
+            j += 1;
         } else {
             return None;
         }
-        let suffix = if off == 0 {
+        if !self.is(j, "JMP") {
+            return None;
+        }
+        let end = self.internal_target(j)?;
+        if !self.err_block_at(a.err) || end <= a.err {
+            return None;
+        }
+        let idx = idx.unwrap_or(&a.idx);
+        self.array_fields
+            .entry(a.arr.clone())
+            .or_default()
+            .insert(off as u32);
+        Some((
+            format!("{}({idx}){}", a.arr, Self::field_suffix(off)),
+            end,
+        ))
+    }
+
+    /// `arr(idx).field = <value>`: the same head, with the value already in
+    /// ECX.
+    fn access_write(&mut self, k: usize, idx: Option<&str>) -> Option<(String, usize)> {
+        let a = self.access_head(k)?;
+        let j = a.elem + 1;
+        if !matches!(
+            self.name_at(j),
+            "MOV [EAX+A] ECX1" | "MOV [EAX+A] ECX2" | "MOV [EAX+A] ECX4"
+        ) {
+            return None;
+        }
+        let off = self.imm(j)?;
+        if !self.is(j + 1, "JMP") {
+            return None;
+        }
+        let end = self.internal_target(j + 1)?;
+        if !self.err_block_at(a.err) || end <= a.err {
+            return None;
+        }
+        let idx = idx.unwrap_or(&a.idx);
+        self.array_fields
+            .entry(a.arr.clone())
+            .or_default()
+            .insert(off as u32);
+        Some((
+            format!("{}({idx}){}", a.arr, Self::field_suffix(off)),
+            end,
+        ))
+    }
+
+    /// `.field`, or nothing when the field offset is zero.
+    fn field_suffix(off: i64) -> String {
+        if off == 0 {
             String::new()
         } else {
             format!(".{}", Self::sd(off))
-        };
-        let tgt = format!("{arr}({idx}){suffix}");
-        let mut s = Stmt::new(self.ins[start].addr, Kind::Misc);
-        s.text = Some(format!("' {tgt}"));
-        s.end = self.endof(j - 1);
-        self.push_stmt(s);
-        self.eax = Some(tgt);
+        }
+    }
+
+    /// The subscript the element access reads, and where it ends.
+    ///
+    /// `ASMTASK_PUSH` pushes one subscript per dimension; an array used without
+    /// a subscript pushes its *internal list index* instead
+    /// (`ASMTASK_PUSHINTERNALARRAYINDEX`), which is the value `ARRAY INDEX(arr)`
+    /// returns and what the `ARRAY INDEX TO TOP` / `NEXT ARRAY INDEX` loop
+    /// machinery walks.
+    fn index_push(&mut self, k: usize) -> Option<(String, usize)> {
+        if let Some((arr, t)) = self.null_guard(k)
+            && self.is(k + 3, "MOV EDX4 [EAX+A]")
+            && self.imm(k + 3).is_some_and(|d| Self::sd(d) == -4)
+            && self.is(k + 4, "PUSH EDX")
+            && t == k + 5
+        {
+            return Some((format!("ARRAY INDEX({arr})"), k + 5));
+        }
+        // An element read used as the subscript: `a(b(i).f)`.
+        if let Some((text, j)) = self.access_read(k, None)
+            && self.is(j, "PUSH EAX")
+        {
+            return Some((text, j + 1));
+        }
+        // The subscript itself, pushing its value.  A subscript whose own
+        // statement already ended with the value in EAX pushes it bare.
+        if self.is(k, "PUSH EAX")
+            && let Some(text) = self.eax.clone()
+        {
+            return Some((text, k + 1));
+        }
+        let saved = self.subscript_at.replace(k);
+        let parsed = self.expr(k);
+        self.subscript_at = saved;
+        let (text, j) = parsed?;
+        if !self.is(j, "PUSH EAX") {
+            return None;
+        }
+        Some((text, j + 1))
+    }
+
+    /// `ASMTASK_CALCARRAYOFFSET`: pop the subscript into EBX, move it to EAX and
+    /// store it in the compiler's offset temporary.  Returns the temporary and
+    /// the index after the block.
+    fn calc_offset(&mut self, k: usize) -> Option<(String, usize)> {
+        let (_arr, t) = self.null_guard(k)?;
+        if !(self.is(k + 3, "POP EBX") && self.is(k + 4, "MOV EAX EBX")) {
+            return None;
+        }
+        let (tmp, next) = self.store(k + 5)?;
+        (t == next).then_some((tmp, next))
+    }
+
+    /// A whole element access, subscript calculation included.
+    fn array_expr(&mut self, k: usize) -> Option<Expr> {
+        let (idx, j) = self.index_push(k)?;
+        let (_tmp, j) = self.calc_offset(j)?;
+        self.access_read(j, Some(&idx))
+    }
+
+    /// `x = arr(idx).field` when the whole access sits in one statement.
+    fn st_array_read(&mut self, k: usize) -> Option<usize> {
+        let (text, j) = self.array_expr(k)?;
+        let (tgt, after) = self.store(j)?;
+        self.stats.assign += 1;
         self.stats.array += 1;
-        Some(j)
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
+        s.text = Some(format!("{tgt} = {text}"));
+        s.end = self.endof(after - 1);
+        self.push_stmt(s);
+        self.eax = Some(text);
+        Some(after)
+    }
+
+    /// `arr(idx).field = <value>`.
+    fn st_array_write(&mut self, k: usize) -> Option<usize> {
+        let (val, j) = match self.expr(k) {
+            Some(e) if self.is(e.1, "MOV ECX EAX") => e,
+            _ => {
+                let (v, j) = self.cmd_value(k)?;
+                (v, j)
+            }
+        };
+        if !self.is(j, "MOV ECX EAX") {
+            return None;
+        }
+        let (lhs, mut next) = self.access_write(j + 1, None)?;
+        while self.is(next, "POP EBX") || self.is(next, "POP EAX") {
+            next += 1;
+        }
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
+        s.text = Some(format!("{lhs} = {val}"));
+        s.end = self.endof(next - 1);
+        self.push_stmt(s);
+        self.stats.assign += 1;
+        self.stats.array += 1;
+        self.eax = None;
+        Some(next)
+    }
+
+    /// The subscript's offset calculation on its own (`ASMTASK_CALCARRAYOFFSET`).
+    ///
+    /// The compiler separates it from the access it belongs to whenever another
+    /// statement's code is emitted in between, so it is transcribed as what it
+    /// is: `temp = <subscript>`.  The readability pass then inlines it back
+    /// into the access that reads it.
+    fn st_arridx(&mut self, k: usize) -> Option<usize> {
+        let (idx, j) = self.index_push(k)?;
+        let (tmp, next) = self.calc_offset(j)?;
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
+        s.text = Some(format!("{tmp} = {idx}"));
+        s.end = self.endof(next - 1);
+        self.push_stmt(s);
+        self.stats.assign += 1;
+        self.eax = None;
+        Some(next)
     }
 
     /// The unreachable array-bounds error path (runtime error 118).
@@ -1189,7 +1503,7 @@ impl<'a> Dec<'a> {
         }
         let mut s = Stmt::new(self.ins[k].addr, Kind::Misc);
         s.text = Some("' [array index out of range -> runtime error 118]".to_string());
-        s.end = self.endof(j);
+        s.end = self.endof(j - 1);
         self.push_stmt(s);
         Some(j)
     }
@@ -1210,6 +1524,10 @@ impl<'a> Dec<'a> {
         if !(self.is(j, "JE") || self.is(j, "JNE")) {
             return None;
         }
+        // Only a reference-table label is a source-level branch.  A raw
+        // relative jump is the compiler's own scaffolding -- the null and
+        // bounds checks of an array access -- and belongs to that statement.
+        self.ref_kind(j, ref_type::LABEL)?;
         let cc = self.name_at(j);
         let tgt = self.jump_target(j);
         let mut s = Stmt::new(self.ins[k].addr, Kind::Cond);
@@ -1230,7 +1548,10 @@ impl<'a> Dec<'a> {
 
     /// A user FUNCTION call.
     fn st_funcall(&mut self, k: usize) -> Option<usize> {
-        let (mut args, mut j) = self.pushes(k, None)?;
+        let (mut args, mut j) = match self.pushes(k, None) {
+            Some(pr) => pr,
+            None => (Vec::new(), k), // a call with no parameters
+        };
         if !self.is(j, "CALL MEM") {
             return None;
         }
@@ -1248,13 +1569,99 @@ impl<'a> Dec<'a> {
             j = next;
         }
         args.reverse();
-        let mut s = Stmt::new(self.ins[k].addr, Kind::Funcall);
-        s.text = Some(format!("CALL {}", Self::funcname(t.unwrap_or(0))));
-        s.extra = Some((args, ret));
-        s.end = self.endof(j);
+        let addr = t.unwrap_or(0);
+        if ret.is_none()
+            && let Some((lhs, next)) = self.elem_store(j)
+        {
+            let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
+            s.text = Some(format!("{lhs} = CALL {}({})", self.funcname(addr), args.join(", ")));
+            s.end = self.endof(next - 1);
+            self.push_stmt(s);
+            self.stats.assign += 1;
+            self.stats.array += 1;
+            Some(next)
+        } else {
+            let mut s = Stmt::new(self.ins[k].addr, Kind::Funcall);
+            s.target = Some(addr);
+            s.extra = Some((args, ret));
+            s.end = self.endof(j - 1);
+            self.push_stmt(s);
+            self.stats.funcall += 1;
+            Some(j)
+        }
+    }
+
+    /// One arm of a `SELECT` dispatch: `CMP EAX,<value>` + `JE <label>`.
+    ///
+    /// The value tested was left in EAX by the preceding statement
+    /// (`ASMTASK_ASSIGNTOEAX`); each `CASE` becomes one comparison against it.
+    fn st_case(&mut self, k: usize) -> Option<usize> {
+        // The first comparison of a chain loads the tested value; the rest use
+        // the value the load left in EAX.
+        let (tested, at) = if self.is(k, "CMP EAX4") {
+            (self.eax.clone()?, k)
+        } else {
+            self.expr(k)?
+        };
+        if !self.is(at, "CMP EAX4") {
+            return None;
+        }
+        let value = self.imm(at)?;
+        let cc = self.name_at(at + 1);
+        if !matches!(cc, "JE" | "JNE") {
+            return None;
+        }
+        let label = self.ref_kind(at + 1, ref_type::LABEL)?;
+        let lbl = self.label(Some(label));
+        let op = if cc == "JE" { "=" } else { "<>" };
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Misc);
+        s.text = Some(format!("IF {tested} {op} {value} THEN GOTO {lbl}"));
+        // the case body label must also be emitted where it lands
+        s.target = Some(label);
+        s.end = self.endof(at + 1);
         self.push_stmt(s);
-        self.stats.funcall += 1;
-        Some(j)
+        self.eax = Some(tested);
+        Some(at + 2)
+    }
+
+    /// A 64-bit floating literal: the compiler stores its two dwords into the
+    /// register spill slots `_TEMPA_` / `_TEMPB_`.
+    fn st_double_imm(&mut self, k: usize) -> Option<usize> {
+        let pair = self.is(k, "MOV MEM IMM4")
+            && self.ref_is(k, ref_type::VARIABLE, 20)
+            && self.is(k + 1, "MOV MEM IMM4")
+            && self.ref_is(k + 1, ref_type::VARIABLE, 24);
+        if !pair {
+            return None;
+        }
+        let lo = self.second_imm(k)? as u64;
+        let hi = self.second_imm(k + 1)? as u64;
+        let value = f64::from_bits((hi << 32) | lo);
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
+        s.text = Some(format!("_TEMPA_# = {value}"));
+        s.end = self.endof(k + 1);
+        self.push_stmt(s);
+        self.stats.assign += 1;
+        Some(k + 2)
+    }
+
+    /// The runtime's break-out check the program epilogue starts with.
+    fn st_break_check(&mut self, k: usize) -> Option<usize> {
+        if !(self.is(k, "MOV EAX MEM4")
+            && self.ref_is(k, ref_type::VARIABLE, 12)
+            && self.is(k + 1, "CMP EAX4")
+            && self.imm(k + 1) == Some(0)
+            && self.is(k + 2, "JNE"))
+        {
+            return None;
+        }
+        self.internal_target(k + 2)?;
+        self.epilogue.get_or_insert(self.ins[k].addr);
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Misc);
+        s.text = Some("' [break-out check: quit unless the runtime asked to stop]".to_string());
+        s.end = self.endof(k + 2);
+        self.push_stmt(s);
+        Some(k + 3)
     }
 
     /// A bare branch.
@@ -1263,6 +1670,9 @@ impl<'a> Dec<'a> {
         if !matches!(nm, "JMP" | "JNE" | "JE" | "JGE" | "JLE") {
             return None;
         }
+        // A raw relative jump is compiler scaffolding (the array error-block
+        // leap, the DIV guard); only a label is a source `GOTO`.
+        self.ref_kind(k, ref_type::LABEL)?;
         let cc = match nm {
             "JMP" => "JMP",
             "JNE" => "JNE",
@@ -1277,6 +1687,35 @@ impl<'a> Dec<'a> {
         s.end = self.endof(k);
         self.push_stmt(s);
         Some(k + 1)
+    }
+
+    /// `INC v` / `DEC v` (`BUILD_INC` / `BUILD_DEC` of a single variable).
+    fn st_incdec(&mut self, k: usize) -> Option<usize> {
+        let nm = self.name_at(k);
+        let op = match nm {
+            "INC MEM1" | "INC MEM2" | "INC MEM4" => "INC",
+            "DEC MEM1" | "DEC MEM2" | "DEC MEM4" => "DEC",
+            _ => return None,
+        };
+        let var = self.varname(self.ref_kind(k, ref_type::VARIABLE)?);
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Misc);
+        s.text = Some(format!("{op} {var}"));
+        s.end = self.endof(k);
+        self.push_stmt(s);
+        Some(k + 1)
+    }
+
+    /// `RETURN <value>`: the value the epilogue leaves in EAX.
+    fn st_return_value(&mut self, k: usize) -> Option<usize> {
+        let (text, j) = self.expr(k)?;
+        if !(self.is(j, "MOV ESP EBP") && self.is(j + 1, "POP EBP") && self.is(j + 2, "RET")) {
+            return None;
+        }
+        let mut s = Stmt::new(self.ins[k].addr, Kind::Misc);
+        s.text = Some(format!("RETURN {text}"));
+        s.end = self.endof(j + 2);
+        self.push_stmt(s);
+        Some(j + 3)
     }
 
     /// RETURN, a function prologue, and frame teardown.
@@ -1308,21 +1747,16 @@ impl<'a> Dec<'a> {
                     }
                 }
             }
+            // the name is resolved when the program is rendered, so it can
+            // come from the blob's own signature table
             let text = match size {
-                Some(n) => format!(
-                    "FUNCTION {}  (stack frame {} bytes)",
-                    Self::funcname(self.ins[k].addr),
-                    n
-                ),
-                None => format!(
-                    "FUNCTION {}  (stack frame None bytes)",
-                    Self::funcname(self.ins[k].addr)
-                ),
+                Some(n) => format!("(stack frame {n} bytes)"),
+                None => "(stack frame unknown)".to_string(),
             };
             let mut s = Stmt::new(self.ins[k].addr, Kind::Func);
             s.text = Some(text);
             s.target = Some(self.ins[k].addr);
-            s.end = self.endof(j);
+            s.end = self.endof(j - 1);
             self.push_stmt(s);
             self.stats.function += 1;
             return Some(j);
@@ -1442,7 +1876,24 @@ impl<'a> Dec<'a> {
             }
         }
 
+        // A label a structured block ends at is not printed, because the block
+        // itself shows where it lands.  Another branch may still name that
+        // address -- an unstructured `GOTO`, or a `CASE` whose body starts
+        // there -- so render once, see which names went missing, and render
+        // again with those labels pinned.
+        self.forced_labels.clear();
+        let out = self.render_once();
+        let missing = missing_labels(&out);
+        if missing.is_empty() {
+            return out;
+        }
+        self.forced_labels = missing;
+        self.render_once()
+    }
+
+    fn render_once(&mut self) -> Vec<String> {
         self.consumed_labels.clear();
+        self.printed.clear();
         let mut out = Vec::with_capacity(self.statements.len() + 16);
         self.block(0, self.statements.len(), 0, &mut out);
         out
@@ -1480,6 +1931,7 @@ impl<'a> Dec<'a> {
                     Some(c) => {
                         out.push(format!("{}REPEAT", Self::ind(depth)));
                         self.block(i, start, depth + 1, out);
+                        self.flush_labels(start, bj + 1, depth, out);
                         out.push(format!(
                             "{}UNTIL {} = 0",
                             Self::ind(depth),
@@ -1489,6 +1941,7 @@ impl<'a> Dec<'a> {
                     None => {
                         out.push(format!("{}DO", Self::ind(depth)));
                         self.block(i, start, depth + 1, out);
+                        self.flush_labels(start, bj + 1, depth, out);
                         out.push(format!("{}LOOP", Self::ind(depth)));
                     }
                 }
@@ -1524,9 +1977,12 @@ impl<'a> Dec<'a> {
             // ---- user function body
             if s.kind == Kind::Func {
                 self.consumed_labels.insert(s.addr);
-                if let Some(t) = &s.text {
-                    out.push(format!("{}{}", Self::ind(depth), t));
-                }
+                out.push(format!(
+                    "{}FUNCTION {}  {}",
+                    Self::ind(depth),
+                    self.funcname(s.addr),
+                    s.text.as_deref().unwrap_or("")
+                ));
                 let mut j = i + 1;
                 while j < hi {
                     let f = &self.statements[j];
@@ -1542,12 +1998,28 @@ impl<'a> Dec<'a> {
             }
 
             if let Some(label) = self.labels.get(&s.addr)
-                && !self.consumed_labels.contains(&s.addr)
+                && (!self.consumed_labels.contains(&s.addr)
+                    || self.forced_labels.contains(label))
             {
                 out.push(format!("{}{}:", Self::ind(depth), label));
+                self.printed.insert(s.addr);
             }
             self.emit(&s, out, depth);
             i += 1;
+        }
+    }
+
+    /// Print the labels of statements a loop consumed, when a branch names
+    /// them: a jump into the back edge has to land somewhere.
+    fn flush_labels(&mut self, lo: usize, hi: usize, depth: usize, out: &mut Vec<String>) {
+        for i in lo..hi.min(self.statements.len()) {
+            let addr = self.statements[i].addr;
+            let Some(label) = self.labels.get(&addr) else {
+                continue;
+            };
+            if self.forced_labels.contains(label) && self.printed.insert(addr) {
+                out.push(format!("{}{}:", Self::ind(depth), label));
+            }
         }
     }
 
@@ -1649,6 +2121,7 @@ impl<'a> Dec<'a> {
             ));
         }
         self.block(c + 1, bj, depth + 1, out);
+        self.flush_labels(c, bj + 1, depth, out);
         out.push(format!("{}NEXT {var}", Self::ind(depth)));
         self.stats.for_ += 1;
         true
@@ -1668,7 +2141,12 @@ impl<'a> Dec<'a> {
                     .as_ref()
                     .map(|(a, _)| a.join(", "))
                     .unwrap_or_default();
-                let call = format!("{}({args})", s.text.as_deref().unwrap_or(""));
+                let name = if s.kind == Kind::Funcall {
+                    format!("CALL {}", self.funcname(s.target.unwrap_or(0)))
+                } else {
+                    s.text.clone().unwrap_or_default()
+                };
+                let call = format!("{name}({args})");
                 match s.extra.as_ref().and_then(|(_, r)| r.clone()) {
                     Some(ret) => out.push(format!("{ind}{ret} = {call}")),
                     None => out.push(format!("{ind}{call}")),
@@ -1682,10 +2160,12 @@ impl<'a> Dec<'a> {
             Kind::Cond => {
                 let lbl = self.label(s.target);
                 let cond = s.cond.as_deref().unwrap_or("");
+                // `cc` says when the branch is taken: `JE` (false) jumps on
+                // zero, `JNE` (true) jumps on anything else.
                 if s.cc == Some("false") {
-                    out.push(format!("IF {cond} <> 0 THEN GOTO {lbl}"));
-                } else {
                     out.push(format!("IF {cond} = 0 THEN GOTO {lbl}"));
+                } else {
+                    out.push(format!("IF {cond} <> 0 THEN GOTO {lbl}"));
                 }
             }
             Kind::Jump => {
@@ -1695,11 +2175,11 @@ impl<'a> Dec<'a> {
                     out.push(format!("{ind}GOTO {}", self.label(s.target)));
                 }
             }
-            Kind::Func => {
-                if let Some(t) = &s.text {
-                    out.push(format!("{ind}{t}"));
-                }
-            }
+            Kind::Func => out.push(format!(
+                "{ind}FUNCTION {}  {}",
+                self.funcname(s.target.unwrap_or(s.addr)),
+                s.text.as_deref().unwrap_or("")
+            )),
             Kind::Misc => {
                 if let Some(t) = &s.text {
                     out.push(format!("{ind}{t}"));
@@ -1731,6 +2211,31 @@ impl<'a> Dec<'a> {
             }
         }
     }
+}
+
+/// Labels the rendered text names but never defines.
+fn missing_labels(out: &[String]) -> HashSet<String> {
+    let mut defined: HashSet<&str> = HashSet::new();
+    let mut used: HashSet<&str> = HashSet::new();
+    for line in out {
+        let s = line.trim();
+        if let Some(name) = s.strip_suffix(':')
+            && name.len() == 7
+            && name.starts_with('L')
+            && name[1..].bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            defined.insert(name);
+        }
+        if let Some(at) = s.rfind("GOTO ")
+            && (at == 0 || s[..at].ends_with(' '))
+        {
+            used.insert(&s[at + 5..]);
+        }
+    }
+    used.into_iter()
+        .filter(|l| !defined.contains(*l))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Split `x <= y` / `x >= y` at the operator, keeping both sides verbatim.

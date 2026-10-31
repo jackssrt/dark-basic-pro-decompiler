@@ -35,7 +35,7 @@ fn bench_stages(c: &mut Criterion) {
     });
 
     c.bench_function("readability pass", |b| {
-        b.iter(|| std::hint::black_box(tidy::tidy(&transcription)))
+        b.iter(|| std::hint::black_box(tidy::tidy(&transcription, None)))
     });
 
     c.bench_function("whole pipeline", |b| {

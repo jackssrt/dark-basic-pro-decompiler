@@ -109,7 +109,8 @@ fn the_readability_pass_balances_and_keeps_the_calls() {
     let mut dec = Dec::new(&prog);
     dec.run();
     let transcription = dec.render().join("\n");
-    let (pretty, legend) = tidy::tidy(&transcription);
+    let prog_end = dec.epilogue.map(|a| format!("L{a:05X}"));
+    let (pretty, legend) = tidy::tidy(&transcription, prog_end.as_deref());
 
     assert!(pipeline::check_structure(&pretty.join("\n")).is_empty());
     assert!(pipeline::check_rewrite(&transcription, &pretty.join("\n")).is_empty());
@@ -251,4 +252,126 @@ fn the_sample_is_the_same_program_as_the_reference_fixture() {
     assert_eq!(prog.appname, "another chance");
     assert_eq!(prog.mcbsize, 2461);
     assert!(Path::new(&sample()).exists());
+}
+
+/// The sample's readable output, for the tests that read it as a user would.
+fn readable_sample() -> (String, String) {
+    let prog = Prog::load_file(sample()).unwrap();
+    let mut dec = Dec::new(&prog);
+    dec.run();
+    let transcription = dec.render().join("\n");
+    let prog_end = dec.epilogue.map(|a| format!("L{a:05X}"));
+    let (pretty, _legend) = tidy::tidy(&transcription, prog_end.as_deref());
+    (transcription, pretty.join("\n"))
+}
+
+#[test]
+fn a_scratch_store_feeding_a_test_is_inlined_and_dropped() {
+    // `t = x = 0` then `IF t <> 0 THEN` is the shape the compiler emits for
+    // `IF x = 0 THEN`: the store must not survive the rewrite.
+    let src = "\
+var$10 = var$20 = 0
+IF var$10 <> 0 THEN
+  TEXT(0, 0, \"hi\")
+ENDIF
+";
+    let (out, _) = tidy::tidy(src, None);
+    let lines: Vec<&str> = out.iter().map(String::as_str).filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 3, "the store survived:\n{}", out.join("\n"));
+    assert!(lines[0].starts_with("IF "), "{}", out.join("\n"));
+    assert!(
+        lines[0].ends_with(" = 0 THEN"),
+        "the comparison was lost: {}",
+        lines[0]
+    );
+}
+
+#[test]
+fn a_return_value_is_a_use_not_a_dead_store() {
+    // The callee leaves its result in EAX; deleting the store that computes it
+    // would delete the result.
+    let src = "\
+FUNCTION FUNC_1  (stack frame 24 bytes)
+loc-8 = ADD(loc-4, 1)
+RETURN loc-8
+ENDFUNCTION
+";
+    let (out, _) = tidy::tidy(src, None);
+    let text = out.join("\n");
+    let ret = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("RETURN"))
+        .unwrap_or("");
+    assert!(ret.len() > "RETURN".len(), "the value was dropped:\n{text}");
+    // the value is still produced exactly where the source produced it
+    assert_eq!(text.matches("v2").count(), 2, "{text}");
+}
+
+#[test]
+fn a_branch_taken_on_zero_reads_as_a_test_for_zero() {
+    // `CMP EAX,0 / JE L` is "jump when the value is zero"; the transcription
+    // must not invert it when it stays a GOTO.
+    let src = "\
+var$5 = 1
+var$6 = 2
+IF var$6 = 0 THEN GOTO L00010
+L00010:
+NEXT_LOOP()
+";
+    let (out, _) = tidy::tidy(src, None);
+    let text = out.join("\n");
+    assert!(
+        text.contains("= 0 THEN GOTO L00010"),
+        "the branch was inverted or lost:\n{text}"
+    );
+    assert!(!text.contains("<> 0 THEN GOTO"), "{text}");
+}
+
+#[test]
+fn a_global_written_once_and_read_in_a_function_survives() {
+    // The callee's body is not reachable by fallthrough, so liveness needs the
+    // call edge; without it the store looks dead and the program changes.
+    let src = "\
+var$1 = 42
+CALL FUNC_1()
+FUNCTION FUNC_1  (stack frame 0 bytes)
+TEXT(0, 0, STR(var$1))
+RETURN
+ENDFUNCTION
+";
+    let (out, _) = tidy::tidy(src, None);
+    let text = out.join("\n");
+    assert!(
+        text.lines().any(|l| l.contains(" = 42")),
+        "the store was deleted:\n{text}"
+    );
+}
+
+#[test]
+fn the_readable_sample_has_no_unused_assignments() {
+    let (_transcription, readable) = readable_sample();
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for line in readable.lines() {
+        for word in line.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if !word.is_empty() {
+                *counts.entry(word.to_string()).or_default() += 1;
+            }
+        }
+    }
+    let unused: Vec<&str> = readable
+        .lines()
+        .filter_map(|l| l.split_once(" = "))
+        .map(|(dst, _)| dst.trim())
+        .filter(|dst| {
+            !dst.is_empty()
+                && dst
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && counts.get(*dst).copied().unwrap_or(0) <= 1
+        })
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "assignments nothing reads: {unused:?}\n{readable}"
+    );
 }

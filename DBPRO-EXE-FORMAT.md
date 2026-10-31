@@ -69,6 +69,33 @@ Straight from `CEXEBlock::Load` / `Save`.  All integers little-endian DWORDs.
 A string array entry is `DWORD length` followed by `length` bytes (no NUL).
 A value array entry is `count` DWORDs; a byte array is `count` bytes.
 
+Section 15, the user-type block, is one NUL-terminated string built by
+`CASMWriter::UpdateStructurePatternData` (`ASMWriter.cpp:2189`).  It holds one
+record per struct table entry with a declaration chain — every `TYPE`, and every
+user `FUNCTION` (`Statement.cpp:3886`) — concatenated with no separator:
+
+```text
+<name>:<struct table index>:<field type letters>:
+```
+
+`UpdateStructurePatternDataRec` writes one letter per field in declaration
+order: `L` integer, `F` float, `S` string, `B` boolean, `Y` byte, `W` word,
+`D` dword, `O` double float, `R` double integer, `-` anything else.  A nested
+user type is expanded in place instead of contributing a letter of its own, so
+the letters are the flattened layout.  `CStructTable::CalculateSize`
+(`StructTable.cpp:289`) puts each field at the running offset with the size of
+its type, so the offsets follow from the letters: 4 bytes each, 8 for `O`/`R`.
+A user function's chain starts with a synthetic `returnvalue` integer slot, so
+its first letter is that return slot and the parameters follow.
+
+Field *names* are not in the format — the compiler uses them only while
+compiling — and no record says whether it is a type or a function.  The
+recovered code resolves the second question: functions appear in the table in
+construction order, which is source order, and the recovered functions are in
+address order, which is also source order, each with its parameter count from
+its call sites.  Matching from the end of the block gives names to the
+functions and leaves the struct layouts behind.
+
 For *Remember*: 40 DLLs, 55862 references, 9999 error strings, MCB 365233 bytes,
 342 commands, 336 strings, no DATA, variable space 1603 bytes, 23 dynamic
 variables, 2562 bytes of user-type patterns.
@@ -100,6 +127,15 @@ Reference types:
 | 4 | immediate | the literal itself (compiler-generated constants only) |
 | 5 | label | byte offset of a jump target in the MCB |
 | 6 | DATA label | index into the data space |
+
+Reference type 5 (label) is patched to a **relative** displacement, not to an
+absolute address: `EXEBlock::Init` writes `label - (operand offset + 4)`.  Type
+4 (immediate) is written verbatim, and the compiler puts more than programmer
+constants there — the displacement of every leap marker is a type-4 reference
+holding the finished rel32 (`ASMWriter::WriteASMLeapMarkerEnd`), and so are
+struct offsets and `[EBP+A]` displacements.  The reference *kind* of a jump is
+therefore meaningful: `LABEL` is a branch the programmer wrote, `IMMEDIATE` is
+compiler scaffolding that belongs to the statement around it.
 
 Decoding the MCB therefore needs no disassembly heuristics beyond the opcode
 table itself, which is `CASMWriter::GenerateASMCodes` (`ASMWriter.cpp:100-379`).
@@ -219,10 +255,66 @@ which is exactly what `decompile.py:for_loop` recognises.
 
 ### Arrays
 
-`arr(i) = v` carries the bounds check inline: pointer load, `CMP EAX,0 / JE`,
-`POP EBX`, subscript→temp, value, then `MOV EDX,[EAX-16] / CMP / JGE`,
-`CMP EBX,-1 / JLE`, `MOV EAX,[EAX+EBX*4]`, `MOV [EAX+off],ECX`, and an
-unreachable `MOV dword[@$_ERR_],118` error block.
+With safe arrays on (`GetArrayCheckFlag`), every element access is bracketed by
+the compiler's own safety code.  All of those jumps are **relative
+displacements written as an immediate reference** (`WriteASMLeapMarkerJump`);
+a source-level branch uses a `LABEL` reference instead.  That one difference is
+what keeps an array statement from being mistaken for an `IF`.
+
+An element access is four emitted blocks:
+
+```text
+; 1  ASMTASK_PUSHINTERNALARRAYINDEX -- only when the source had no subscript
+MOV EAX,[@arr]   CMP EAX,0   JE <next>
+MOV EDX,[EAX-4]              ; the array's list cursor
+PUSH EDX
+<next>:
+
+; 2  ASMTASK_CALCARRAYOFFSET -- pop the subscript into the offset temporary
+MOV EAX,[@arr]   CMP EAX,0   JE <after>
+POP EBX   MOV EAX,EBX   MOV [@tmp],EAX
+<after>:
+
+; 3  the element itself (CalculateArrayOffsetInEBX)
+MOV EAX,[@arr]   CMP EAX,0   JE <error>
+MOV EBX,[@tmp]               ; or an immediate
+PUSH EDX   MOV EDX,[EAX-16]   CMP EDX,EBX   POP EDX   JGE <error>
+CMP EBX,-1   JLE <error>
+MOV EAX,[EAX+EBX*4]
+
+; 4  the field inside the element, then the leap over the error block
+MOV ECX,[EAX+off]   MOV EAX,ECX      ; read
+MOV [EAX+off],ECX                    ; write (value already in ECX)
+JMP <end>
+<error>:  MOV [@$_ERR_],118           ; + the runtime-error hook, 26 bytes
+<end>:
+```
+
+`[EAX-16]` is the element count, `[EAX-4]` the list cursor — the value
+`ARRAY INDEX(arr)` returns, which is what `ARRAY INDEX TO TOP` / `NEXT ARRAY
+INDEX` move.  A store evaluates its value between blocks 2 and 3, and block 4
+is exactly `WriteASMEAXtoARR`; a read is `WriteASMARRtoEAX`.  The error block is
+unreachable, so the transcription folds it into the statement.
+
+A **multi-dimensional** array adds `POP EDX / IMUL EDX,[EAX-56+4*i] / ADD
+EBX,EDX` per extra dimension inside block 2, one subscript per dimension pushed
+in reverse order.  Those are not reconstructed yet — *Remember* has two of
+them — and they stay as one undecoded region each.
+
+### SELECT / CASE
+
+`SELECT` writes the tested value into EAX (`ASMTASK_ASSIGNTOEAX`) and then one
+`CMP EAX,<case value>` + `JE <case label>` per case (`ASMTASK_CONDITIONDATA`,
+`ParseJump.cpp`), ending with a `JMP` past the last case.  Comparing against an
+immediate is what distinguishes a case from a normal `IF`, whose compare is
+always `CMP EAX,0`.
+
+### SYNC()
+
+`SYNC()` is not a call in the compiled code: `BUILD_SYNC` emits
+`CALL ProcessMessages` followed by `CMP EAX,1 / JE $labelend`, so the program
+leaves when the runtime says it was asked to quit.  The transcription writes it
+back as `SYNC()`.
 
 ### User functions
 
@@ -296,6 +388,8 @@ region that splits into a decoded statement plus a smaller gap raises the
 count while lowering the bytes.  The warning fires above 10% of the code, so a
 program that has quietly stopped decoding cannot pass as clean.
 
+These are the numbers the Python toolchain reported, kept for reference:
+
 | program | statements | commands | undecoded |
 |---|---|---|---|
 | `null.exe` | 117 | 22 | 11 of 2,266 bytes (0.49%) |
@@ -303,12 +397,19 @@ program that has quietly stopped decoding cannot pass as clean.
 | `Remember` | 16,662 | 6,127 | 4,482 of 365,233 bytes (1.23%) |
 | `lostmemory.exe` | 39,317 | 7,736 | 53,497 of 841,740 bytes (6.36%) |
 
-Three things account for most of what is still missing.  The array-of-user-type
-recognisers need the pointer arithmetic the compiler wraps around a subscript,
-and that preamble sits at a different offset in each context it appears in;
-user-function prologues that save several parameters before the body are only
-recognised in the shapes seen so far; and the rest is short fragments — a
-register shuffle, a `POP`, a table load — that carry no statement of their own.
+The Rust port decodes `lostmemory.exe` completely:
+
+| program | statements | commands | undecoded |
+|---|---|---|---|
+| `lostmemory.exe` | 24,837 | 7,739 | **0 of 841,740 bytes (0.00%)** |
+
+The difference is the array model above.  The old recognisers matched the
+element access from its pointer load, so every one of them left the
+null-guard preamble, the subscript calculation and the error block behind as
+fragments; `lostmemory.exe` has 2,538 element accesses, each contributing a
+handful of those.  Decoding the four blocks as they are emitted — and treating
+a relative jump as part of its statement rather than as a branch — removes all
+of them.
 
 ### Why nothing is ever dropped
 
@@ -351,7 +452,9 @@ rewrites it as `readable.dba`, which is the same program with:
   `IF c THEN ... GOTO L ENDIF ... L:` shape turned into a real `IF/ELSE`, and
   jumps to the program epilogue turned into `END`;
 * variables renamed from the role their use implies, with a legend in the file
-  mapping each name back to its byte offset.
+  mapping each name back to its byte offset;
+* user types listed with their field layout, and every user function called by
+  its name from the blob's signature table (see §2).
 
 Two rules keep this pass from changing what the program does:
 
@@ -360,11 +463,14 @@ Two rules keep this pass from changing what the program does:
   changes its value (a clock and a random sequence both advance) and inlining
   it twice evaluates it twice.  The number and order of such calls in
   `readable.dba` is identical to `recovered.dba`.
-* **a definition is dropped only where it cannot be reached.**  Where the
-  decompiler's block boundaries and the program's own disagree — an `IF` the
-  decompiler closed early, which happens in a few places — a condition that
-  folded to a constant is *derived*, not written in the source, so its branch
-  is kept rather than deleted.
+* **a definition is dropped only where nothing can read it.**  The pass builds
+  the control-flow graph out of the recovered statements — branch targets,
+  loop bodies, `IF/ELSE` arms, `RETURN` — and runs a backward liveness
+  analysis over it, so a store is deleted only when its destination is not live
+  after it on any path.  A scratch store that fed an `IF` test is live up to the
+  moment the test is rewritten to use its value, and dead immediately after.
+  A definition that folded to a constant from a value copied out of a branch the
+  decompiler closed early is marked, and its branch is kept.
 
 Names are role-based rather than recovered: the format stores byte offsets, so
 the identifiers are simply not in the file.  `i`/`j` are loop counters by

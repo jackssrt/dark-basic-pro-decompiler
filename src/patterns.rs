@@ -18,16 +18,23 @@ pub enum Shape<'a> {
         hi: &'a str,
         step: Option<&'a str>,
     },
-    /// `IF <cond> <> 0 THEN [GOTO L]`
+    /// `IF <cond> <> 0 THEN [GOTO L]`, or the `CASE` form
+    /// `IF <cond> = <n> THEN GOTO L`.
     If {
         cond: &'a str,
         op: &'a str,
+        /// The value compared against, for the `CASE` form.
+        value: Option<&'a str>,
         target: Option<&'a str>,
     },
     /// `NEXT` or `NEXT v` -- but not `NEXT ARRAY INDEX(a)`.
     Next,
-    /// `arr(index)`
-    ArrayDst(&'a str, &'a str),
+    /// `arr(index)`, or `arr(index).field`
+    ArrayDst {
+        name: &'a str,
+        index: &'a str,
+        field: Option<&'a str>,
+    },
     /// A header line of `recovered.dba`, which is replaced, not repeated.
     Banner,
 }
@@ -92,37 +99,54 @@ fn find_step(s: &str) -> Option<usize> {
 ///
 /// The condition is the shortest prefix that leaves `<> 0 THEN` (or
 /// `= 0 THEN`) immediately behind, so `a > b <> 0` tests `a > b`.
-fn if_parts(s: &str) -> Option<(&str, &str, Option<&str>)> {
+fn if_parts(s: &str) -> Option<(&str, &str, Option<&str>, Option<&str>)> {
     let rest = s.strip_prefix("IF")?.trim_start();
     for i in (1..rest.len()).filter(|i| rest.is_char_boundary(*i)) {
         let cond = rest[..i].trim_end();
         if cond.is_empty() {
             continue;
         }
-        if let Some((op, target)) = zero_then(rest[i..].trim_start()) {
-            return Some((cond, op, target));
+        if let Some((op, value, target)) = zero_then(rest[i..].trim_start()) {
+            return Some((cond, op, value, target));
         }
     }
     None
 }
 
-/// Does `s` begin with `<> 0 THEN` or `= 0 THEN`, optionally followed by
-/// `GOTO <label>`? Returns the comparison operator and the label.
-fn zero_then(s: &str) -> Option<(&'static str, Option<&str>)> {
+/// Does `s` begin with `<> 0 THEN`, `= 0 THEN` or `= <n> THEN` (the `CASE`
+/// form), optionally followed by `GOTO <label>`?
+fn zero_then<'a>(s: &'a str) -> Option<(&'static str, Option<&'a str>, Option<&'a str>)> {
     for op in ["<>", "="] {
         let Some(head) = s.strip_prefix(op) else {
             continue;
         };
-        let head = head.strip_prefix(" 0 ")?;
+        let head = head.strip_prefix(' ')?;
+        // the compared value: `0`, or the case value
+        let end = head
+            .find(' ')
+            .filter(|e| *e > 0 && !head[..*e].is_empty())
+            .unwrap_or(head.len());
+        let value = &head[..end];
+        let is_number = !value.is_empty()
+            && value
+                .trim_start_matches('-')
+                .bytes()
+                .all(|b| b.is_ascii_digit());
+        if !is_number {
+            continue;
+        }
+        let head = head[end..].strip_prefix(' ')?;
         let head = head.strip_prefix("THEN")?;
+        // `<> 0` / `= 0` is the boolean form: there is no case value
+        let value = if value == "0" { None } else { Some(value) };
         if head.is_empty() {
-            return Some((op, None));
+            return Some((op, value, None));
         }
         let label = head.strip_prefix(" GOTO ")?.trim();
         if label.is_empty() || label.contains(char::is_whitespace) {
             continue;
         }
-        return Some((op, Some(label)));
+        return Some((op, value, Some(label)));
     }
     None
 }
@@ -157,15 +181,20 @@ pub fn shape(s: &str) -> Option<Shape<'_>> {
         return Some(Shape::Next);
     }
     if s.starts_with("IF ")
-        && let Some((cond, op, target)) = if_parts(s)
+        && let Some((cond, op, value, target)) = if_parts(s)
     {
-        return Some(Shape::If { cond, op, target });
+        return Some(Shape::If {
+            cond,
+            op,
+            value,
+            target,
+        });
     }
     if let Some((var, lo, hi, step)) = for_parts(s) {
         return Some(Shape::For { var, lo, hi, step });
     }
-    if let Some((name, idx)) = array_dst(s) {
-        return Some(Shape::ArrayDst(name, idx));
+    if let Some((name, idx, field)) = array_dst(s) {
+        return Some(Shape::ArrayDst { name, index: idx, field });
     }
     None
 }
@@ -187,11 +216,26 @@ fn is_identifierish(s: &str) -> bool {
 }
 
 /// `name(index)`
-fn array_dst(s: &str) -> Option<(&str, &str)> {
+fn array_dst(s: &str) -> Option<(&str, &str, Option<&str>)> {
     let open = s.find('(')?;
     let name = &s[..open];
-    let inner = s[open + 1..].strip_suffix(')')?;
-    (is_identifierish(name) && !inner.is_empty() && !inner.contains(')')).then_some((name, inner))
+    let rest = &s[open + 1..];
+    // `arr(i)` or `arr(i).12` -- the field offset the compiler writes after an
+    // array element store
+    let close = rest.find(')')?;
+    let inner = &rest[..close];
+    let tail = &rest[close + 1..];
+    let field = if tail.is_empty() {
+        None
+    } else {
+        Some(tail.strip_prefix('.')?)
+    };
+    if field.is_some_and(|f| f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    (is_identifierish(name) && !inner.is_empty() && !inner.contains(')')).then_some((
+        name, inner, field,
+    ))
 }
 
 /// The first line of `recovered.dba`'s own header.
@@ -275,19 +319,29 @@ mod tests {
 
     #[test]
     fn reads_conditions_left_to_right() {
-        assert_eq!(if_parts("IF a > b <> 0 THEN"), Some(("a > b", "<>", None)));
+        assert_eq!(
+            if_parts("IF a > b <> 0 THEN"),
+            Some(("a > b", "<>", None, None))
+        );
         assert_eq!(
             if_parts("IF a > b <> 0 THEN GOTO L00097E"),
-            Some(("a > b", "<>", Some("L00097E")))
+            Some(("a > b", "<>", None, Some("L00097E")))
         );
-        assert_eq!(if_parts("IF a = 0 THEN"), Some(("a", "=", None)));
+        assert_eq!(if_parts("IF a = 0 THEN"), Some(("a", "=", None, None)));
+        // a `CASE` test compares against its own value
+        assert_eq!(
+            if_parts("IF a = 7 THEN GOTO L1"),
+            Some(("a", "=", Some("7"), Some("L1")))
+        );
         assert_eq!(if_parts("IF a THEN"), None);
     }
 
     #[test]
     fn reads_array_destinations() {
-        assert_eq!(array_dst("arr$3(2)"), Some(("arr$3", "2")));
-        assert_eq!(array_dst("n3(x + 1)"), Some(("n3", "x + 1")));
+        assert_eq!(array_dst("arr$3(2)"), Some(("arr$3", "2", None)));
+        assert_eq!(array_dst("arr$3(2).12"), Some(("arr$3", "2", Some("12"))));
+        assert_eq!(array_dst("arr$3(2).x"), None);
+        assert_eq!(array_dst("n3(x + 1)"), Some(("n3", "x + 1", None)));
         assert_eq!(array_dst("3(x)"), None);
     }
 

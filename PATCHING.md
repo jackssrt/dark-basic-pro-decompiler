@@ -18,8 +18,15 @@ editing anything.
 | **section** | the command table, string table, variable-space size | past the end of the machine code block |
 
 A literal is a plain immediate in the code and edits in place.  A ref-backed
-operand edits in the ref table and the code stays `FF FF FF FF`.  See
+operand edits the ref table and the code stays `FF FF FF FF`.  See
 `DBPRO-EXE-FORMAT.md` §3 for why the two exist.
+
+Type 4 ("immediate") slots are not all programmer constants: the compiler also
+stores *displacements* there — the distance of an array null/bounds check, the
+`[EBP+A]` frame offset of a local, the offset of a field inside a user type.
+Changing one of those changes the control flow or the address a statement
+touches, not a value.  `DBPRO-EXE-FORMAT.md` §5 decodes every shape the compiler
+emits, so read the statement the slot belongs to before editing it.
 
 ## Steps
 

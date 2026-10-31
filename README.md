@@ -15,7 +15,7 @@ dbp-list     playagain/_virtual.dat --from 0x100
 dbp-extract  game.exe -o out/                 # pull the blob out of a game
 ```
 
-`dbp-decompile` writes four files:
+`dbp-decompile` writes five files:
 
 | file | what it is |
 |---|---|
@@ -23,19 +23,27 @@ dbp-extract  game.exe -o out/                 # pull the blob out of a game
 | `recovered.dba` | one BASIC statement per line, a direct transcription |
 | `readable.dba` | the same program after the readability pass |
 | `report.txt` | what was found, and the checks that ran |
+| `mcb.elf` | the machine code block as a loadable ELF32 image, for a disassembler |
 
 ## What it recovers
 
 * the container (display mode, DLLs, commands, strings, variable space) and the
   instruction stream with its references applied;
-* statements: library command calls, assignments, array reads and stores,
-  comparisons and arithmetic;
+* statements: library command calls, assignments, array element reads and
+  stores (`arr(i).field`), comparisons, arithmetic, `INC`/`DEC`, `SYNC()`,
+  `SELECT`/`CASE` dispatches and 64-bit literals;
 * control flow: `IF/THEN`, `REPEAT/UNTIL`, `DO/LOOP`, `FOR/NEXT` and user
-  `FUNCTION/ENDFUNCTION`, recovered from the branch graph;
-* readability: scratch variables copy-propagated and dead stores deleted,
-  DBP operator calls (`EQUAL`, `ADD`, `CAST INTEGER TO DOUBLE` ...) rewritten as
-  operators, IEEE-754 immediates re-typed as decimals, the compiler's loop
-  lowering undone, and variables named after the role their use implies.
+  `FUNCTION/ENDFUNCTION`, recovered from the branch graph.  Only a
+  reference-table label is a source branch; the compiler's own relative jumps
+  (array null and bounds checks, the `DIV` guard) stay inside their statement;
+* user types and user-function signatures from the blob's own pattern block:
+  struct names with their field layout, and the name and parameter types of
+  every user function, which the transcription then calls by name;
+* readability: scratch variables copy-propagated and dead stores deleted by a
+  liveness analysis over the recovered control-flow graph, DBP operator calls
+  (`EQUAL`, `ADD`, `CAST INTEGER TO DOUBLE` ...) rewritten as operators,
+  IEEE-754 immediates re-typed as decimals, the compiler's loop lowering undone,
+  and variables named after the role their use implies.
 
 Undecoded regions are never hidden: they stay in the output as a comment
 carrying the raw instructions, and they are counted in the report.
@@ -58,16 +66,21 @@ The stages, measured with `cargo bench --bench decompile` on the sample program
 
 | stage | |
 |---|---|
-| container parse | 141 µs |
-| listing | 149 µs |
-| statements and control flow | 99 µs |
-| readability pass | 1.19 ms |
-| whole pipeline | 1.70 ms |
+| container parse | 142 µs |
+| listing | 160 µs |
+| statements and control flow | 209 µs |
+| readability pass | 1.74 ms |
+| whole pipeline | 2.37 ms |
 
 On a larger program -- the 1.1 MB blob of *Remember* (365 KB of machine code,
-87 045 instructions, 5437 statements, 57 functions) -- the whole pipeline takes
-0.5 s, against 11 s for the Python toolchain it was ported from, and produces
-byte-identical output.
+87 045 instructions, 57 functions) -- the whole pipeline takes 0.9 s, against
+11 s for the Python toolchain it was ported from.
+
+Everything decodes: `lostmemory.exe` (841 KB of machine code, 189 379
+instructions, 24 837 recovered statements) comes back with **0 bytes
+undecoded**, and the checks pass; *Remember* is at 0.04% (three regions, 162
+bytes: two multi-dimensional array subscripts and one comparison whose operands
+arrive in registers), and the sample programs at 0.
 
 The readability pass recognises each statement's shape with the hand-written
 matchers in `src/patterns.rs`. `cargo bench --bench patterns` measures them
@@ -84,6 +97,7 @@ it does.
 | `names` | DLL export name -> DBP keyword |
 | `listing` | the symbolised listing |
 | `decompile` | statements, expressions, control flow, the transcription |
+| `utypes` | the blob's user-type and user-function signatures |
 | `patterns` | the statement shapes the readability pass recognises |
 | `tidy` | the readability pass |
 | `extract` | finding the blob inside a compiled game |

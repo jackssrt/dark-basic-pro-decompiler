@@ -89,6 +89,7 @@ fn run<W: Write>(args: &Args, out: &mut W) -> io::Result<ExitCode> {
         listing,
         recovered,
         readable,
+        image,
         report,
         warnings,
         ..
@@ -102,6 +103,7 @@ fn run<W: Write>(args: &Args, out: &mut W) -> io::Result<ExitCode> {
     ] {
         std::fs::write(outdir.join(name), body)?;
     }
+    std::fs::write(outdir.join("mcb.elf"), &image.bytes)?;
     for line in report.lines() {
         say(line);
     }

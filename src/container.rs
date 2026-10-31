@@ -286,6 +286,14 @@ impl Prog {
         Self::from_bytes(&std::fs::read(path)?)
     }
 
+    /// The struct and user-function signatures the compiler recorded.
+    ///
+    /// The block is a convenience for the debugger, so it is parsed on demand:
+    /// a malformed entry costs an empty row, never the decompilation.
+    pub fn utypes(&self) -> Vec<crate::utypes::UType> {
+        crate::utypes::parse(&self.utype)
+    }
+
     fn load(&mut self, data: &[u8]) -> Result<()> {
         let mut r = Reader { buf: data, at: 0 };
         self.mode = r.u32()?;

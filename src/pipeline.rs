@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::container::Prog;
-use crate::decompile::{Dec, Kind};
-use crate::{extract, listing, tidy};
+use crate::{decompile::{Dec, Kind}, extract, image, listing, tidy, utypes};
 
 /// One thing the checks found wrong.
 pub type Warning = String;
@@ -142,6 +141,8 @@ pub fn side_effects(text: &str) -> BTreeMap<String, usize> {
         "LESS",
         "NOT EQUAL",
         "EQUATE",
+        // reads the array list cursor; moving it is a separate command
+        "ARRAY INDEX",
     ];
     const FOLDED: &[&str] = &[
         "CAST INTEGER TO DOUBLE",
@@ -308,7 +309,12 @@ pub fn blob_for(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// The header `recovered.dba` opens with.
-pub fn recovered_header(blob: &Path, prog: &Prog, dec: &Dec<'_>) -> String {
+pub fn recovered_header(
+    blob: &Path,
+    prog: &Prog,
+    dec: &Dec<'_>,
+    sig: &utypes::Signatures,
+) -> String {
     let branches = prog
         .ins
         .iter()
@@ -357,6 +363,12 @@ pub fn recovered_header(blob: &Path, prog: &Prog, dec: &Dec<'_>) -> String {
         dec.gaps
     );
     h.push_str("'\n");
+    h.push_str("' User types and user-function signatures recorded in the blob.  The format\n");
+    h.push_str("' stores the field types in declaration order, not the field names.\n");
+    for line in utypes::describe(sig) {
+        let _ = writeln!(h, "{line}");
+    }
+    h.push_str("'\n");
     h.push_str(
         "' Names: variable-space slots appear as var$<byte offset>; EBP-relative slots as\n",
     );
@@ -387,6 +399,8 @@ pub struct Outcome {
     pub recovered: String,
     /// The readability rewrite (`readable.dba`).
     pub readable: String,
+    /// The reconstructed executable image (`mcb.elf`).
+    pub image: image::Image,
     /// The report (`report.txt`).
     pub report: String,
     /// Anything the checks found wrong.
@@ -394,7 +408,7 @@ pub struct Outcome {
 }
 
 /// Run the whole pipeline over `blob`, writing nothing: the caller decides
-/// where the four artifacts go. `outdir` is recorded in the report.
+/// where the five artifacts go. `outdir` is recorded in the report.
 pub fn run(blob: &Path, outdir: &Path) -> Result<Outcome, crate::container::Error> {
     let started = Instant::now();
     let prog = Prog::load_file(blob)?;
@@ -403,17 +417,35 @@ pub fn run(blob: &Path, outdir: &Path) -> Result<Outcome, crate::container::Erro
 
     let mut dec = Dec::new(&prog);
     dec.run();
+    // The blob records the user types and the user-function signatures the
+    // compiler saw; matching them to the recovered functions gives both back.
+    let sig = utypes::align(prog.utypes(), &dec.functions());
+    dec.name_functions(
+        sig.functions
+            .iter()
+            .map(|(addr, t)| (*addr, t.name.clone()))
+            .collect(),
+    );
+    let funcs: Vec<u32> = dec
+        .statements
+        .iter()
+        .filter(|s| s.kind == Kind::Func)
+        .map(|s| s.addr)
+        .collect();
+    let img = image::build(&prog, &funcs);
     let lines = dec.render();
     let transcription = lines.join("\n");
 
-    let (pretty, legend) = tidy::tidy(&transcription);
+    let prog_end = dec.epilogue.map(|a| format!("L{a:05X}"));
+    let (pretty, legend) = tidy::tidy(&transcription, prog_end.as_deref());
     let nfunc = dec
         .statements
         .iter()
         .filter(|s| s.kind == Kind::Func)
         .count();
-    let mut readable = String::from(tidy::HEADER);
+    let mut readable = tidy::header(&prog.appname);
     tidy::write_legend(&mut readable, &legend, nfunc);
+    readable.push_str(&type_block(&sig, &dec));
     readable.push('\n');
     readable.push_str(&pretty.join("\n"));
     readable.push('\n');
@@ -422,7 +454,11 @@ pub fn run(blob: &Path, outdir: &Path) -> Result<Outcome, crate::container::Erro
     warnings.extend(check_structure(&readable));
     warnings.extend(check_rewrite(&transcription, &readable));
 
-    let recovered = format!("{}{}\n", recovered_header(blob, &prog, &dec), transcription);
+    let recovered = format!(
+        "{}{}\n",
+        recovered_header(blob, &prog, &dec, &sig),
+        transcription
+    );
 
     let mut report = String::new();
     let _ = writeln!(report, "DarkBASIC PRO decompilation");
@@ -439,6 +475,8 @@ pub fn run(blob: &Path, outdir: &Path) -> Result<Outcome, crate::container::Erro
     report.push_str(&report_body(
         &prog,
         &dec,
+        &sig,
+        &img,
         pretty.len(),
         lines.len(),
         legend.len(),
@@ -460,13 +498,67 @@ pub fn run(blob: &Path, outdir: &Path) -> Result<Outcome, crate::container::Erro
         listing,
         recovered,
         readable,
+        image: img,
         report,
         warnings,
     })
 }
 
 /// The container, transcription and rewrite sections of the report.
-fn report_body(prog: &Prog, dec: &Dec<'_>, pretty: usize, raw: usize, named: usize) -> String {
+/// The user types, for the header of `readable.dba`.
+fn type_block(sig: &utypes::Signatures, dec: &Dec<'_>) -> String {
+    let mut out = String::new();
+    if sig.types.is_empty() && sig.functions.is_empty() {
+        return out;
+    }
+    out.push_str("'\n' User types recorded in the blob (field names are not stored):\n");
+    for t in &sig.types {
+        let _ = writeln!(out, "'   {:<18} {}", t.name, t.describe());
+    }
+    // arrays whose element fields fit exactly one user type
+    let fits: Vec<String> = dec
+        .array_fields
+        .iter()
+        .filter_map(|(arr, fields)| {
+            let t = utypes::fit(&sig.types, fields)?;
+            Some(format!("'   {arr:<18} element type: {}", t.name))
+        })
+        .collect();
+    if !fits.is_empty() {
+        out.push_str(
+            "'\n' Arrays whose element fields fit exactly one user type (inferred from the\n\
+             ' field offsets the code accesses):\n",
+        );
+        for line in fits {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    out.push_str("'\n' User functions and their parameter types:\n");
+    for (addr, f) in &sig.functions {
+        let params: Vec<&str> = f.fields.iter().map(|x| x.type_name()).collect();
+        let _ = writeln!(
+            out,
+            "'   {:<18} at {addr:05X}: {}",
+            f.name,
+            if params.is_empty() {
+                "no parameters".to_string()
+            } else {
+                params.join(", ")
+            }
+        );
+    }
+    out
+}
+
+fn report_body(
+    prog: &Prog,
+    dec: &Dec<'_>,
+    sig: &utypes::Signatures,
+    img: &image::Image,
+    pretty: usize,
+    raw: usize,
+    named: usize,
+) -> String {
     let mut r = String::new();
     let _ = writeln!(r, "container");
     let _ = writeln!(r, "  application name   : {}", prog.appname);
@@ -513,6 +605,12 @@ fn report_body(prog: &Prog, dec: &Dec<'_>, pretty: usize, raw: usize, named: usi
     let _ = writeln!(r, "  IF tests            : {}", dec.stats.cond);
     let _ = writeln!(r, "  FOR/NEXT loops      : {}", dec.stats.for_);
     let _ = writeln!(r, "  user functions      : {}", dec.stats.function);
+    let _ = writeln!(
+        r,
+        "  user types named    : {} structs, {} function signatures",
+        sig.types.len(),
+        sig.functions.len()
+    );
     let distinct: BTreeSet<u32> = dec.statements.iter().filter_map(|s| s.line).collect();
     let _ = writeln!(r, "  original lines      : {} distinct", distinct.len());
     let (gbytes, mbytes) = undecoded(dec);
@@ -530,6 +628,33 @@ fn report_body(prog: &Prog, dec: &Dec<'_>, pretty: usize, raw: usize, named: usi
     let _ = writeln!(r, "readability rewrite (readable.dba)");
     let _ = writeln!(r, "  lines               : {pretty} (from {raw})");
     let _ = writeln!(r, "  named variables     : {named}");
+    r.push('\n');
+    let _ = writeln!(r, "image (mcb.elf)");
+    let _ = writeln!(r, "  format              : ELF32, little-endian i386");
+    let _ = writeln!(
+        r,
+        "  .text @ {:#x}    : {} bytes (MCB + RET + {} command stubs)",
+        image::TEXT_BASE,
+        img.layout.text_len,
+        prog.cmd_name.len()
+    );
+    let _ = writeln!(
+        r,
+        "  .data @ {:#x}    : {} bytes variables, {} strings, {} bytes data block",
+        img.layout.data_base,
+        prog.varsize,
+        prog.strings.len(),
+        prog.datablock.len()
+    );
+    let nfunc = dec.stats.function;
+    let ndata = img.symbols.len() - 1 - nfunc as usize - prog.cmd_name.len();
+    let _ = writeln!(
+        r,
+        "  symbols           : 1 program + {nfunc} user functions + {} command stubs + {ndata} data symbols",
+        prog.cmd_name.len()
+    );
+    r.push_str("  note: ref slots patched as the runtime patches them;\n");
+    r.push_str("  addresses chosen for static analysis, not recovered\n");
     r.push('\n');
     r
 }
