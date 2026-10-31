@@ -348,6 +348,52 @@ ENDFUNCTION
 }
 
 #[test]
+fn every_block_body_is_indented_one_level_in() {
+    let src = "\
+IF var$1 <> 0 THEN
+' <<< 5 bytes not recognised at 000EA7 >>>
+'   000EA7  CALL MEM                 L04033
+  IF var$2 <> 0 THEN
+    TEXT(0, 0, \"hi\")
+  ENDIF
+ENDIF
+FUNCTION FUNC_1  (stack frame 8 bytes)
+loc-8 = RND(10)
+IF loc-8 <> 0 THEN
+RETURN loc-8
+ENDIF
+ENDFUNCTION
+";
+    let (out, _) = tidy::tidy(src, None);
+    let lines: Vec<&str> = out.iter().map(String::as_str).collect();
+    // (indent, prefix) for each line, in order.
+    let expected = [
+        (0, "IF "),
+        (2, "' [undecoded 5]"),
+        (2, "IF "),
+        (4, "TEXT(0, 0, \"hi\")"),
+        (2, "ENDIF"),
+        (0, "ENDIF"),
+        (0, "FUNCTION FUNC_1"),
+        (2, "v1 = RND(10)"),
+        (2, "IF "),
+        (2, "ENDIF"),
+        (2, "RETURN "),
+        (0, "ENDFUNCTION"),
+    ];
+    let text = out.join("\n");
+    assert_eq!(lines.len(), expected.len(), "unexpected lines:\n{text}");
+    for (line, (indent, prefix)) in lines.iter().zip(expected) {
+        let got = line.len() - line.trim_start().len();
+        assert_eq!(got, indent, "wrong indent on {line:?}:\n{text}");
+        assert!(
+            line.trim_start().starts_with(prefix),
+            "{line:?} does not start with {prefix:?}:\n{text}"
+        );
+    }
+}
+
+#[test]
 fn the_readable_sample_has_no_unused_assignments() {
     let (_transcription, readable) = readable_sample();
     let mut counts: std::collections::BTreeMap<String, usize> = Default::default();

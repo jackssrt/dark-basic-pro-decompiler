@@ -2941,7 +2941,7 @@ fn emit(blk: &Block, out: &mut Vec<String>, depth: usize) {
     let ind = "  ".repeat(depth);
     for n in &blk.stmts {
         if let Some(l) = &n.lead {
-            out.push(l.clone());
+            out.push(format!("{ind}{l}"));
         }
         if let Some(t) = &n.tail {
             out.push(format!("{ind}{t}"));
@@ -2962,7 +2962,7 @@ fn emit(blk: &Block, out: &mut Vec<String>, depth: usize) {
                 let body = n.raw.join(" ; ");
                 let words: Vec<&str> = n.text.as_deref().unwrap_or("").split_whitespace().collect();
                 let count = words.get(2).copied().unwrap_or("");
-                out.push(format!("' [undecoded {count}] {body}"));
+                out.push(format!("{ind}' [undecoded {count}] {body}"));
             }
             K::Label => out.push(format!("{ind}{}:", n.target.as_deref().unwrap_or(""))),
             K::Jump => out.push(format!("{ind}GOTO {}", n.target.as_deref().unwrap_or(""))),
@@ -3046,7 +3046,7 @@ fn emit(blk: &Block, out: &mut Vec<String>, depth: usize) {
             K::Func => {
                 out.push(format!("{ind}{}", n.text.as_deref().unwrap_or("")));
                 if let Some(b) = &n.body {
-                    emit(b, out, depth);
+                    emit(b, out, depth + 1);
                 }
                 out.push(format!("{ind}ENDFUNCTION"));
             }
