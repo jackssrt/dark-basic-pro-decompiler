@@ -1,5 +1,9 @@
 # dark-basic-pro-decompiler
 
+> [!WARNING]  
+> this whole thing is vibecoded. im just putting that out there first. but it works nonetheless, and really well!
+
+
 Turns a compiled DarkBASIC PRO game back into readable BASIC, without ever
 running the program or the compiler.
 
