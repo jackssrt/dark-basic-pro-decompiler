@@ -103,8 +103,8 @@ enum Expr {
     Id(String),
     /// `base.field`, where the base is a plain identifier.
     Fld(Box<Expr>, String),
-    /// `base[index]`.
-    Arr(Box<Expr>, Box<Expr>),
+    /// `base[i, j, ...]`.
+    Arr(Box<Expr>, Vec<Expr>),
     /// `NAME(args)`.
     Call(String, Vec<Expr>),
     /// `lhs op rhs`, `op` being a symbolic operator or `AND` / `OR`.
@@ -446,9 +446,12 @@ impl<'t> Parser<'t> {
                 n = Expr::Fld(Box::new(n), field);
             } else if self.kind() == "op" && self.val() == "(" {
                 self.next();
-                let idx = self.expr()?;
+                let mut subs = vec![self.expr()?];
+                while self.eat("op", Some(",")) {
+                    subs.push(self.expr()?);
+                }
                 self.expect("op", Some(")"))?;
-                n = Expr::Arr(Box::new(n), Box::new(idx));
+                n = Expr::Arr(Box::new(n), subs);
             } else {
                 return Ok(n);
             }
@@ -632,7 +635,7 @@ fn is_pure(e: &Expr) -> bool {
         Expr::Call(n, args) => {
             PURE.contains(&n.to_uppercase().as_str()) && args.iter().all(is_pure)
         }
-        Expr::Arr(base, idx) => is_pure(base) && is_pure(idx),
+        Expr::Arr(base, subs) => is_pure(base) && subs.iter().all(is_pure),
         Expr::Fld(base, _) => is_pure(base),
         Expr::Bin(_, l, r) => is_pure(l) && is_pure(r),
         Expr::Un(_, x) => is_pure(x),
@@ -676,9 +679,11 @@ fn collect_vars(e: Option<&Expr>, f: &mut impl FnMut(&str)) {
                 f(v);
             }
         }
-        Expr::Arr(b, i) => {
+        Expr::Arr(b, subs) => {
             collect_vars(Some(b), f);
-            collect_vars(Some(i), f);
+            for i in subs {
+                collect_vars(Some(i), f);
+            }
         }
         Expr::Call(_, args) => args.iter().for_each(|a| collect_vars(Some(a), f)),
         Expr::Bin(_, l, r) => {
@@ -696,7 +701,7 @@ fn mentions(e: &Expr, name: &str) -> bool {
     match e {
         Expr::Id(v) => v == name,
         Expr::Fld(b, _) => matches!(&**b, Expr::Id(v) if v == name),
-        Expr::Arr(b, i) => mentions(b, name) || mentions(i, name),
+        Expr::Arr(b, subs) => mentions(b, name) || subs.iter().any(|i| mentions(i, name)),
         Expr::Call(_, args) => args.iter().any(|a| mentions(a, name)),
         Expr::Bin(_, l, r) => mentions(l, name) || mentions(r, name),
         Expr::Un(_, x) => mentions(x, name),
@@ -915,7 +920,10 @@ fn render_at(e: &Expr, ctx: u8) -> String {
         Expr::Num(n) => lit(*n),
         Expr::Str(s) | Expr::Id(s) => s.clone(),
         Expr::Fld(b, f) => format!("{}.{f}", render_at(b, 100)),
-        Expr::Arr(b, i) => format!("{}({})", render_at(b, 100), render_at(i, 0)),
+        Expr::Arr(b, subs) => {
+            let a: Vec<String> = subs.iter().map(|i| render_at(i, 0)).collect();
+            format!("{}({})", render_at(b, 100), a.join(", "))
+        }
         Expr::Call(n, args) => {
             let a: Vec<String> = args.iter().map(|a| render_at(a, 0)).collect();
             format!("{n}({})", a.join(", "))
@@ -942,9 +950,11 @@ fn rename(e: Option<&Expr>, table: &HashMap<String, String>) -> Option<Expr> {
     Some(match e {
         Expr::Id(v) => Expr::Id(table.get(v).cloned().unwrap_or_else(|| v.clone())),
         Expr::Fld(b, f) => Expr::Fld(Box::new(rename(Some(b), table).unwrap()), f.clone()),
-        Expr::Arr(b, i) => Expr::Arr(
+        Expr::Arr(b, subs) => Expr::Arr(
             Box::new(rename(Some(b), table).unwrap()),
-            Box::new(rename(Some(i), table).unwrap()),
+            subs.iter()
+                .map(|i| rename(Some(i), table).unwrap())
+                .collect(),
         ),
         Expr::Call(n, args) => Expr::Call(
             n.clone(),
@@ -1559,9 +1569,11 @@ impl Inliner {
                 }
             }
             Expr::Fld(b, f) => Some(Expr::Fld(Box::new(self.subst(Some(b), depth)?), f.clone())),
-            Expr::Arr(b, i) => Some(Expr::Arr(
+            Expr::Arr(b, subs) => Some(Expr::Arr(
                 Box::new(self.subst(Some(b), depth)?),
-                Box::new(self.subst(Some(i), depth)?),
+                subs.iter()
+                    .map(|i| self.subst(Some(i), depth))
+                    .collect::<Option<Vec<_>>>()?,
             )),
             Expr::Call(n, args) => Some(Expr::Call(
                 n.clone(),
@@ -1890,9 +1902,11 @@ fn called_names(e: Option<&Expr>, f: &mut impl FnMut(&str)) {
                 called_names(Some(a), f);
             }
         }
-        Expr::Arr(b, i) => {
+        Expr::Arr(b, subs) => {
             called_names(Some(b), f);
-            called_names(Some(i), f);
+            for i in subs {
+                called_names(Some(i), f);
+            }
         }
         Expr::Fld(b, _) => called_names(Some(b), f),
         Expr::Bin(_, l, r) => {
@@ -2524,11 +2538,13 @@ fn note_roles(e: Option<&Expr>, side: char, roles: &mut RoleMap, self_var: &str,
     let Some(e) = e else { return };
     match e {
         Expr::Id(_) => {}
-        Expr::Arr(b, i) => {
+        Expr::Arr(b, subs) => {
             if let Expr::Id(v) = &**b {
                 roles.entry(v.clone()).or_default().arr += 1;
             }
-            note_roles(Some(i), side, roles, self_var, owner);
+            for i in subs {
+                note_roles(Some(i), side, roles, self_var, owner);
+            }
         }
         Expr::Fld(b, _) => {
             if let Expr::Id(v) = &**b {

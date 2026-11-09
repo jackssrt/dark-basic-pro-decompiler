@@ -297,9 +297,13 @@ is exactly `WriteASMEAXtoARR`; a read is `WriteASMARRtoEAX`.  The error block is
 unreachable, so the transcription folds it into the statement.
 
 A **multi-dimensional** array adds `POP EDX / IMUL EDX,[EAX-56+4*i] / ADD
-EBX,EDX` per extra dimension inside block 2, one subscript per dimension pushed
-in reverse order.  Those are not reconstructed yet — *Remember* has two of
-them — and they stay as one undecoded region each.
+EBX,EDX` per extra dimension inside block 2.  The compiler parses the source
+subscript list from right to left, so the subscripts go on the stack in
+reverse order: `POP EBX` takes the first source subscript, and each extra
+`POP EDX` takes the next one.  The decompiler records the subscripts in source
+order, renders them as `arr(a, b, ...)`, and folds the offset calculation into
+the access that reads its temporary.  If the temporary is computed apart from
+the access, the calculation stays as `tmp = ARRAY OFFSET(a, b, ...)`.
 
 ### SELECT / CASE
 
@@ -483,19 +487,17 @@ the argument count in mind.
 
 ### Recovered result for *Remember*
 
-`recovered.dba` is 19992 lines covering:
+`recovered.dba` is 16 640 lines covering:
 
-* 6062 of 6138 library command calls (98.7%), with their arguments in source order
-* 2627 assignments, comparisons, arithmetic expressions and array stores
+* 6137 library command calls, with their arguments in source order
+* 2937 assignments, comparisons, arithmetic expressions and array stores
   (including the `DIM ARRAY` initialisers)
-* 798 IF/ENDIF blocks (up to 5 levels deep), 44 FOR/NEXT loops,
-  25 DO/LOOP loops, 57 FUNCTION/ENDFUNCTION blocks
+* 817 IF tests, 100 FOR/NEXT loops and 57 FUNCTION/ENDFUNCTION blocks
 * the original line number for every statement (2765 distinct source lines)
-* 377 gap regions (2.4% of statements), emitted inline as commented raw
-  instructions so nothing is silently lost
+* **no undecoded regions**: all 87 045 instructions belong to a statement
 
-`readable.dba` is the same program in 9761 lines, with the same 377
-undecoded regions and the same 3360 side-effecting calls.
+`readable.dba` is the same program in 7512 lines, with the same calls and no
+undecoded regions.
 
 Not recovered: variable *identifiers*, comments and REM statements, and the
 argument-count-driven keyword distinctions where several DBP keywords share one

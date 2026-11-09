@@ -81,10 +81,14 @@ On a larger program -- the 1.1 MB blob of *Remember* (365 KB of machine code,
 11 s for the Python toolchain it was ported from.
 
 Everything decodes: `lostmemory.exe` (841 KB of machine code, 189 379
-instructions, 24 837 recovered statements) comes back with **0 bytes
-undecoded**, and the checks pass; *Remember* is at 0.04% (three regions, 162
-bytes: two multi-dimensional array subscripts and one comparison whose operands
-arrive in registers), and the sample programs at 0.
+instructions, 24 793 recovered statements) and *Remember* (365 KB, 87 045
+instructions, 15 850 recovered statements) both come back with **0 bytes
+undecoded**, and the checks pass; the sample programs decode cleanly too.
+The last shapes to fall were multi-dimensional array subscripts, whose
+per-dimension `POP EDX / IMUL / ADD` chain the compiler emits inside the
+offset calculation, and 64-bit DLL results returned in `EDX:EAX`, which the
+compiler spills to an adjacent pair of frame slots before pushing the two
+dwords.
 
 The readability pass recognises each statement's shape with the hand-written
 matchers in `src/patterns.rs`. `cargo bench --bench patterns` measures them

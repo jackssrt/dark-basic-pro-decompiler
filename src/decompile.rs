@@ -163,6 +163,17 @@ pub struct Dec<'a> {
     /// Position whose subscript is being parsed, if any.  Stops the expression
     /// parser from re-entering the array-access parser at that same position.
     subscript_at: Option<usize>,
+    /// The multi-dimensional offset calculation sitting immediately before
+    /// the statement being decoded: `(statement index, start address,
+    /// temporary, subscripts in source order)`.  A statement that reads the
+    /// temporary absorbs the calculation, because the compiler split one
+    /// source subscript calculation from the access that consumes it.
+    active_offset: Option<(usize, u32, String, Vec<String>)>,
+    /// The calculation a statement just emitted, for the next statement to
+    /// absorb if it reads the temporary.
+    pending_offset: Option<(usize, u32, String, Vec<String>)>,
+    /// The offset temporary the statement just recognised read.
+    used_offset: Option<String>,
 }
 
 /// The index one past the statement at `k`.
@@ -207,6 +218,9 @@ impl<'a> Dec<'a> {
             stats: Stats::default(),
             eax: None,
             subscript_at: None,
+            active_offset: None,
+            pending_offset: None,
+            used_offset: None,
             forced_labels: HashSet::new(),
             printed: HashSet::new(),
         }
@@ -489,6 +503,27 @@ impl<'a> Dec<'a> {
                 return Some((format!("{base}.{o}"), k + 2));
             }
         }
+        // A 64-bit result arriving in EDX:EAX from a DLL call.  The compiler
+        // spills the high dword next to the low one and gets both back for the
+        // pair push (`PUSH EDX` / `PUSH EAX`):
+        //
+        //   MOV EAX,EDX   MOV [EBP+d+4],EAX   MOV EAX,[EBP+d+4]
+        //   MOV EDX,EAX   MOV EAX,[EBP+d]      PUSH EDX  PUSH EAX
+        //
+        // The value is the 8-byte slot at `d`.
+        if nm == "MOV EAX EDX4"
+            && self.is(k + 1, "MOV [EBP+A] EAX4")
+            && self.is(k + 2, "MOV EAX4 [EBP+A]")
+            && self.is(k + 3, "MOV EDX EAX")
+            && self.is(k + 4, "MOV EAX4 [EBP+A]")
+            && self.is(k + 5, "PUSH EDX")
+            && self.is(k + 6, "PUSH EAX")
+            && let (Some(hi), Some(lo)) = (self.imm(k + 1), self.imm(k + 4))
+            && self.imm(k + 2) == Some(hi)
+            && Self::sd(hi) == Self::sd(lo) + 4
+        {
+            return Some((format!("{}#", Self::ebpname(lo)), k + 5));
+        }
         if nm == "MOV EBX MEM4"
             && let Some(i) = self.ref_kind(k, ref_type::VARIABLE)
         {
@@ -736,13 +771,21 @@ impl<'a> Dec<'a> {
                     j = e.1 + 2;
                 }
                 // an 8-byte value already in ST0 pushes as two dwords
-                Some(e) if e.0.ends_with('#') => match self.push_double(e.1) {
-                    Some(pd) => {
+                Some(e) if e.0.ends_with('#') => {
+                    if self.is(e.1, "PUSH EDX") && self.is(e.1 + 1, "PUSH EAX") {
+                        // a 64-bit result spilled to memory: high, then low
                         args.push(e.0);
-                        j = pd;
+                        j = e.1 + 2;
+                        continue;
                     }
-                    None => break,
-                },
+                    match self.push_double(e.1) {
+                        Some(pd) => {
+                            args.push(e.0);
+                            j = pd;
+                        }
+                        None => break,
+                    }
+                }
                 Some(_) => break,
                 None => {
                     if let Some(v) = &eax
@@ -789,17 +832,62 @@ impl<'a> Dec<'a> {
             }
             s.end = self.endof(j - 1);
             self.push_stmt(s);
+            self.active_offset = None;
+            self.pending_offset = None;
             return j;
         }
 
-        match self.try_all(k) {
-            Some(j) => j,
-            None => self.st_gap(k),
+        // The calculation the previous statement emitted is available to this
+        // one, which may read its temporary; once this statement is decoded,
+        // the calculation is either absorbed or dropped.
+        self.active_offset = self.pending_offset.take();
+        self.used_offset = None;
+        let base = self.statements.len();
+        let j = match self.try_all(k) {
+            Some(j) => {
+                self.fuse_offset(base);
+                j
+            }
+            None => {
+                self.active_offset = None;
+                self.st_gap(k)
+            }
+        };
+        self.active_offset = None;
+        j
+    }
+
+    /// Absorb the offset statement the recognised statement just consumed.
+    ///
+    /// A multi-dimensional access is emitted by the compiler in two pieces:
+    /// the subscript calculation stores a flat offset in a temporary, and the
+    /// access reads that temporary.  When the two land in consecutive
+    /// statements, the first is scaffolding, not a source statement, so it is
+    /// folded into the access that reads it.
+    fn fuse_offset(&mut self, base: usize) -> bool {
+        let Some((idx, addr, tmp, _)) = self.active_offset.take() else {
+            return false;
+        };
+        if self.used_offset.as_deref() != Some(tmp.as_str()) {
+            return false;
         }
+        if idx + 1 != base
+            || idx >= self.statements.len()
+            || self.statements.len() != base + 1
+            || self.statements[idx].addr != addr
+        {
+            return false;
+        }
+        self.statements.remove(idx);
+        if let Some(s) = self.statements.get_mut(idx) {
+            s.addr = addr;
+        }
+        true
     }
 
     /// Every recogniser except [`Dec::st_gap`], in priority order.
     fn try_all(&mut self, k: usize) -> Option<usize> {
+        self.used_offset = None;
         self.st_frame(k)
             .or_else(|| self.st_sync(k))
             .or_else(|| self.st_array_read(k))
@@ -870,19 +958,30 @@ impl<'a> Dec<'a> {
             let mut run_start: Option<usize> = None;
             let mut k = lo;
             while k < hi {
+                self.active_offset = self.pending_offset.take();
+                self.used_offset = None;
+                let base = self.statements.len();
                 match self.try_all(k) {
                     Some(j) if k < j && j <= hi => {
+                        let fused = self.fuse_offset(base);
+                        let at = if fused { base - 1 } else { base };
+                        let fresh: Vec<Stmt> = self.statements.split_off(at);
                         if let Some(r) = run_start.take() {
                             self.add_gap(r, k);
                         }
+                        self.statements.extend(fresh);
                         k = j;
                     }
                     _ => {
+                        self.active_offset = None;
+                        self.pending_offset = None;
                         run_start = Some(run_start.unwrap_or(k));
                         k += 1;
                     }
                 }
             }
+            self.active_offset = None;
+            self.pending_offset = None;
             if let Some(r) = run_start {
                 self.add_gap(r, hi);
             }
@@ -1313,7 +1412,7 @@ impl<'a> Dec<'a> {
         if !self.err_block_at(a.err) || end <= a.err {
             return None;
         }
-        let idx = idx.unwrap_or(&a.idx);
+        let idx = self.subscript_text(idx, &a.idx);
         self.array_fields
             .entry(a.arr.clone())
             .or_default()
@@ -1343,7 +1442,7 @@ impl<'a> Dec<'a> {
         if !self.err_block_at(a.err) || end <= a.err {
             return None;
         }
-        let idx = idx.unwrap_or(&a.idx);
+        let idx = self.subscript_text(idx, &a.idx);
         self.array_fields
             .entry(a.arr.clone())
             .or_default()
@@ -1352,6 +1451,25 @@ impl<'a> Dec<'a> {
             format!("{}({idx}){}", a.arr, Self::field_suffix(off)),
             end,
         ))
+    }
+
+    /// The subscript text for an access.
+    ///
+    /// Normally it is the index the access loads itself.  A multi-dimensional
+    /// access instead loads a flat *offset* temporary that an earlier
+    /// statement computed from the subscripts; that statement recorded them,
+    /// and they are what the source said.
+    fn subscript_text(&mut self, given: Option<&str>, loaded: &str) -> String {
+        if let Some(g) = given {
+            return g.to_string();
+        }
+        match &self.active_offset {
+            Some((_, _, tmp, subs)) if tmp == loaded => {
+                self.used_offset = Some(loaded.to_string());
+                subs.join(", ")
+            }
+            _ => loaded.to_string(),
+        }
     }
 
     /// `.field`, or nothing when the field offset is zero.
@@ -1405,19 +1523,72 @@ impl<'a> Dec<'a> {
     /// `ASMTASK_CALCARRAYOFFSET`: pop the subscript into EBX, move it to EAX and
     /// store it in the compiler's offset temporary.  Returns the temporary and
     /// the index after the block.
-    fn calc_offset(&mut self, k: usize) -> Option<(String, usize)> {
-        let (_arr, t) = self.null_guard(k)?;
-        if !(self.is(k + 3, "POP EBX") && self.is(k + 4, "MOV EAX EBX")) {
+    ///
+    /// A multi-dimensional access adds one
+    /// `POP EDX / IMUL EDX,[EAX-56+4*i] / ADD EBX,EDX` per extra dimension
+    /// before the store; `dims` is the number of subscripts the access pushed.
+    fn calc_offset(&mut self, k: usize, dims: usize) -> Option<(String, usize)> {
+        if dims == 0 {
             return None;
         }
-        let (tmp, next) = self.store(k + 5)?;
+        let (_arr, t) = self.null_guard(k)?;
+        let mut j = k + 3;
+        if !self.is(j, "POP EBX") {
+            return None;
+        }
+        j += 1;
+        for _ in 1..dims {
+            if !(self.is(j, "POP EDX")
+                && self.is(j + 1, "IMUL EDX4 [EAX+A]")
+                && self.imm(j + 1).is_some()
+                && self.is(j + 2, "ADD EBX EDX4"))
+            {
+                return None;
+            }
+            j += 3;
+        }
+        if !self.is(j, "MOV EAX EBX") {
+            return None;
+        }
+        j += 1;
+        let (tmp, next) = self.store(j)?;
         (t == next).then_some((tmp, next))
+    }
+
+    /// Every subscript an array access pushes, in source order.
+    ///
+    /// `ASMTASK_PUSH` emits one push per dimension; the offset calculation
+    /// that follows consumes them.  The loop stops at the calculation, which
+    /// starts with the array's null guard followed by `POP EBX`.
+    fn subscripts(&mut self, k: usize) -> Option<(Vec<String>, usize)> {
+        let mut subs = Vec::new();
+        let mut j = k;
+        while subs.len() < 8 {
+            if self.null_guard(j).is_some() && self.is(j + 3, "POP EBX") {
+                break;
+            }
+            match self.index_push(j) {
+                Some((text, next)) if next > j => {
+                    subs.push(text);
+                    j = next;
+                }
+                _ => break,
+            }
+        }
+        if subs.is_empty() {
+            return None;
+        }
+        // The compiler pushes the subscripts in reverse order (last subscript
+        // first), so the stack order runs backwards through the source.
+        subs.reverse();
+        Some((subs, j))
     }
 
     /// A whole element access, subscript calculation included.
     fn array_expr(&mut self, k: usize) -> Option<Expr> {
-        let (idx, j) = self.index_push(k)?;
-        let (_tmp, j) = self.calc_offset(j)?;
+        let (subs, j) = self.subscripts(k)?;
+        let (_tmp, j) = self.calc_offset(j, subs.len())?;
+        let idx = subs.join(", ");
         self.access_read(j, Some(&idx))
     }
 
@@ -1468,14 +1639,28 @@ impl<'a> Dec<'a> {
     /// is: `temp = <subscript>`.  The readability pass then inlines it back
     /// into the access that reads it.
     fn st_arridx(&mut self, k: usize) -> Option<usize> {
-        let (idx, j) = self.index_push(k)?;
-        let (tmp, next) = self.calc_offset(j)?;
+        let (subs, j) = self.subscripts(k)?;
+        let dims = subs.len();
+        let (tmp, next) = self.calc_offset(j, dims)?;
+        let text = if dims == 1 {
+            format!("{tmp} = {}", subs[0])
+        } else {
+            // The compiler folds the subscripts into a flat offset using the
+            // array's own dimension sizes, which are runtime values.  Record
+            // what it does know: the subscripts, and the temporary they land
+            // in.  A statement that reads the temporary absorbs it.
+            format!("{tmp} = ARRAY OFFSET({})", subs.join(", "))
+        };
         let mut s = Stmt::new(self.ins[k].addr, Kind::Assign);
-        s.text = Some(format!("{tmp} = {idx}"));
+        s.text = Some(text);
         s.end = self.endof(next - 1);
         self.push_stmt(s);
         self.stats.assign += 1;
         self.eax = None;
+        if dims > 1 {
+            let idx = self.statements.len() - 1;
+            self.pending_offset = Some((idx, self.ins[k].addr, tmp, subs));
+        }
         Some(next)
     }
 
