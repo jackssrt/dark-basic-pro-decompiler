@@ -70,20 +70,19 @@ The stages, measured with `cargo bench --bench decompile` on the sample program
 
 | stage | |
 |---|---|
-| container parse | 142 µs |
-| listing | 160 µs |
-| statements and control flow | 209 µs |
-| readability pass | 1.74 ms |
-| whole pipeline | 2.37 ms |
+| container parse | 109 µs |
+| listing | 110 µs |
+| statements and control flow | 207 µs |
+| readability pass | 1.48 ms |
+| whole pipeline | 1.97 ms |
 
 On a larger program -- the 1.1 MB blob of *Remember* (365 KB of machine code,
-87 045 instructions, 57 functions) -- the whole pipeline takes 0.9 s, against
-11 s for the Python toolchain it was ported from.
+87 045 instructions, 57 functions) -- the whole pipeline takes 0.9 s.
 
 Everything decodes: `lostmemory.exe` (841 KB of machine code, 189 379
 instructions, 24 793 recovered statements) and *Remember* (365 KB, 87 045
 instructions, 15 850 recovered statements) both come back with **0 bytes
-undecoded**, and the checks pass; the sample programs decode cleanly too.
+undecoded**, and the checks pass; the sample program decodes cleanly too.
 The last shapes to fall were multi-dimensional array subscripts, whose
 per-dimension `POP EDX / IMUL / ADD` chain the compiler emits inside the
 offset calculation, and 64-bit DLL results returned in `EDX:EAX`, which the
@@ -92,9 +91,8 @@ dwords.
 
 The readability pass recognises each statement's shape with the hand-written
 matchers in `src/patterns.rs`. `cargo bench --bench patterns` measures them
-against the regexes they replaced: 3.1 µs per transcription against 23.3 µs for
-the equivalent compiled set, because compiling that set costs more than matching
-it does.
+against an equivalent set of compiled regexes over the sample transcription:
+1.82 µs against 15.5 µs per pass.
 
 ## Layout
 
@@ -119,14 +117,14 @@ cargo test
 cargo bench
 ```
 
-Compressed containers (`compress.dll`) can only be expanded on Windows, where
-the bundled DLL can be loaded; elsewhere the tool says so and asks for
-`--compress-dll` on a Windows host.
+Compressed containers carry the game's own `compress.dll`; expanding one
+loads that DLL, so it only works on Windows.  Elsewhere the tool says so and
+asks for `--compress-dll` on a Windows host (or a Wine prefix).
 
 The sample program in `tests/data/` is a `_virtual.dat` taken from a compiled
-game; the tests and benchmarks run against it.  The port was validated against
-a second, much larger program as well -- see `DBPRO-EXE-FORMAT.md` for what
-that blob contains.
+game; the tests and benchmarks run against it.  The decompiler has also been
+validated against much larger programs -- `DBPRO-EXE-FORMAT.md` records what
+their blobs contain and what was recovered from them.
 
 Two documents sit alongside this one.  `DBPRO-EXE-FORMAT.md` describes the
 container and the symbolic machine code block.  `PATCHING.md` describes editing

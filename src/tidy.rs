@@ -86,7 +86,7 @@ impl Num {
 }
 
 impl PartialEq for Num {
-    /// Python compares `1 == 1.0`, so mixed literals are equal here too.
+    /// Mixed integer and float literals compare equal (`1 == 1.0`).
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => a == b,
@@ -553,14 +553,15 @@ fn decode_float(v: i64) -> Option<f64> {
     None
 }
 
-/// Round half away from zero, as Python's `round` does for these magnitudes.
+/// Round to `digits` decimal places, half away from zero.
 fn round_to(f: f64, digits: u32) -> f64 {
     let m = 10f64.powi(digits as i32);
     let scaled = f * m;
     (scaled + 0.5).floor() / m
 }
 
-/// Python's `repr` for a float, with its 17-digit fallback trimmed.
+/// Render a float without exponent notation, using fixed 10-decimal form where
+/// the shortest rendering would otherwise use one.
 fn repr_float(f: f64) -> String {
     if f.abs() >= 1e16 || (f != 0.0 && f.abs() < 1e-4) {
         return format!("{f:.10}");

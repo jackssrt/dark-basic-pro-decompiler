@@ -123,7 +123,7 @@ Overwrite the opcode byte.  Two constraints:
 * **Same width.**  `B8` (`MOV EAX,imm32`) → `B9` (`MOV ECX,imm32`) → `3D`
   (`CMP EAX,imm32`) is safe; → `31` (`XOR EAX,EAX`) is not, because the operand
   bytes then become the next instruction.
-* **The operand the neighbours assume.**  the compiler's idiom is
+* **The operand the neighbours assume.**  The compiler's idiom is
   *load into EAX, then store or compare*, so a `MOV EAX,x` that becomes
   `MOV ECX,x` still stores stale EAX.
 
@@ -174,10 +174,11 @@ size is what you wrote.
 
 ### 7. Verify
 
-Re-run the pipeline on the patched blob and read what it says:
+Write the patched blob under the name `_virtual.dat` (any other name is parsed
+as a game container) and re-run the pipeline on it:
 
 ```sh
-dbp-decompile patched.dat -o out/
+dbp-decompile patched/_virtual.dat -o out/
 ```
 
 * the statement you changed now reads with the new value;

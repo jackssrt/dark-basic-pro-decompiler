@@ -128,5 +128,3 @@ as tunable thresholds.
 - `dbp-list` numbering restarts at the start of a `--from/--to` window, so a
   windowed line can differ from the full listing in its variable/command
   numbering even though the address matches.
-- `DBPRO-EXE-FORMAT.md` section 6 documents an older Python toolchain; those
-  scripts are not in this repo.

@@ -1,8 +1,8 @@
 # DarkBASIC PRO `_virtual.dat` — format and decompilation notes
 
-Everything below was derived from the compiler source in this repository
-(`DBProCompiler/DBPCompiler/`) and verified byte-for-byte against
-`dbpdata_remember/_virtual.dat` from the *Remember* executable.
+Everything below was derived from the compiler source in `DBProCompiler/DBPCompiler/`
+and verified byte-for-byte against `_virtual.dat` blobs taken from real games
+(*Remember*, *lostmemory*) and the sample in `tests/data/`.
 
 ## 1. How DarkEXE loads and runs the compiled program
 
@@ -251,7 +251,7 @@ L:  v = v + s              (the loop label points at the increment)
     JMP L
 ```
 
-which is exactly what `decompile.py:for_loop` recognises.
+which is what the `FOR` recogniser in `decompile.rs` matches.
 
 ### Arrays
 
@@ -327,37 +327,36 @@ back as `SYNC()`.
 and locals/temps at negative offsets (`CParseUserFunction::ActOnLocalVars`).
 Calls are `CALL rel32` to the label `$label <name>`.
 
-## 6. Tooling in this directory
+## 6. Tooling
 
-| file | purpose |
+The repository builds three binaries with `cargo build --release`:
+
+| binary | purpose |
 |---|---|
-| `dbp/decompile_all.py` | runs the whole pipeline; start here |
-| `dbp/dbp_extract.py` | pulls `_virtual.dat` out of a game exe or .pck |
-| `dbp/dbpdis.py` | container parser + symbolic disassembler (exact, 0 undecodable bytes) |
-| `dbp/listing.py` | emits the fully symbolised assembly listing |
-| `dbp/names.py` | decorated DLL export → DarkBASIC keyword |
-| `dbp/decompile.py` | statement-level decompiler and control-flow structurer |
-| `dbp/tidy.py` | readability pass over `recovered.dba` |
-| `mcb_listing.asm` | 87045-line symbolised listing of the machine code block |
-| `recovered.dba` | recovered BASIC, machine-faithful, one statement per line |
-| `readable.dba` | the same program as source you can read |
+| `dbp-decompile` | runs the whole pipeline; start here |
+| `dbp-extract` | pulls `_virtual.dat` out of a game exe or `.pck` |
+| `dbp-list` | prints the symbolised listing, optionally for an address window |
 
 One command, from a game executable or from a blob:
 
 ```sh
-python3 dbp/decompile_all.py game.exe -o out/
+dbp-decompile game.exe -o out/
 ```
 
-That writes `listing.asm`, `recovered.dba`, `readable.dba` and `report.txt`,
-then checks its own work and exits non-zero if a check fails.  The stages are
-also runnable on their own:
+That writes `listing.asm`, `recovered.dba`, `readable.dba`, `report.txt` and
+`mcb.elf` (the machine code block as a loadable ELF32 image), then checks its
+own work and exits non-zero if any check warns.  The stages are also runnable
+on their own:
 
 ```sh
-python3 dbp/dbp_extract.py game.exe -o out/          # just the blob
-python3 dbp/listing.py    out/_virtual.dat > mcb_listing.asm
-python3 dbp/decompile.py  out/_virtual.dat recovered.dba
-python3 dbp/tidy.py       recovered.dba readable.dba
+dbp-extract game.exe -o out/                  # just the blob
+dbp-list    out/_virtual.dat                  # the symbolised listing
+dbp-list    out/_virtual.dat --from 0x100 --to 0x200
 ```
+
+A file is treated as a blob only when it is named `_virtual.dat`; any other
+name is parsed as a game container, so point the listing at the extracted blob,
+or pass the executable and let the tool extract it.
 
 `recovered.dba` is the artifact to check a claim against: it is a direct
 transcription of the machine code, so every statement in it can be checked
@@ -367,10 +366,10 @@ against the listing.  `readable.dba` is the same program after the passes in
 Neither the compiler nor the target executable is executed; everything is static
 parsing of the on-disk blob.
 
-### What the driver checks
+### What the pipeline checks
 
 The checks are what make the pipeline trustworthy on a program it has never
-seen, so they run every time and a failure is a non-zero exit:
+seen, so `dbp-decompile` runs them every time and a warning is a non-zero exit:
 
 | check | what would make it fire |
 |---|---|
@@ -392,28 +391,20 @@ region that splits into a decoded statement plus a smaller gap raises the
 count while lowering the bytes.  The warning fires above 10% of the code, so a
 program that has quietly stopped decoding cannot pass as clean.
 
-These are the numbers the Python toolchain reported, kept for reference:
+The large programs checked so far decode completely.  On `lostmemory.exe`
+(841,740 bytes of machine code):
 
 | program | statements | commands | undecoded |
 |---|---|---|---|
-| `null.exe` | 117 | 22 | 11 of 2,266 bytes (0.49%) |
-| `unknown.exe` | 1,999 | 640 | 534 of 42,409 bytes (1.26%) |
-| `Remember` | 16,662 | 6,127 | 4,482 of 365,233 bytes (1.23%) |
-| `lostmemory.exe` | 39,317 | 7,736 | 53,497 of 841,740 bytes (6.36%) |
+| `lostmemory.exe` | 24,793 | 7,739 | **0 of 841,740 bytes (0.00%)** |
 
-The Rust port decodes `lostmemory.exe` completely:
-
-| program | statements | commands | undecoded |
-|---|---|---|---|
-| `lostmemory.exe` | 24,837 | 7,739 | **0 of 841,740 bytes (0.00%)** |
-
-The difference is the array model above.  The old recognisers matched the
-element access from its pointer load, so every one of them left the
-null-guard preamble, the subscript calculation and the error block behind as
-fragments; `lostmemory.exe` has 2,538 element accesses, each contributing a
-handful of those.  Decoding the four blocks as they are emitted — and treating
-a relative jump as part of its statement rather than as a branch — removes all
-of them.
+The last shapes to fall were the array model above and multi-dimensional
+subscripts.  An element access is four emitted blocks, and recognising it from
+its pointer load alone leaves the null-guard preamble, the subscript
+calculation and the error block behind as fragments; `lostmemory.exe` has 2,538
+element accesses, each contributing a handful of those.  Decoding the four
+blocks as they are emitted -- and treating a relative jump as part of its
+statement rather than as a branch -- removes all of them.
 
 ### Why nothing is ever dropped
 
@@ -424,20 +415,21 @@ instruction address *inside* each gap, because a compiler preamble — saving a
 value, stashing it, loading a table — routinely sits in front of a shape that
 is perfectly recognisable, and the first pass never gets past it to see it.
 
-That second pass is what takes `lostmemory.exe` from 38.8% undecoded to 6.4%,
-and `Remember` from 4.1% to 1.2%.  It is also why gap *counts* went up while
-gap *bytes* went down: one 108-byte region became a decoded statement plus
-several small gaps, which is a win, not a regression.
+That second pass is what recovers statements hiding behind compiler preambles.
+It is also why gap *counts* can go up while gap *bytes* go down: one 108-byte
+region became a decoded statement plus several small gaps, which is a win, not
+a regression.
 
-The driver checks the invariant that makes this safe — every instruction in the
-block belongs to some statement, so refining a gap cannot lose code — and
+`dbp-decompile` checks the invariant that makes this safe — every instruction
+in the block belongs to some statement, so refining a gap cannot lose code — and
 reports it on every run.
 
 ## 7. Reading the recovered program
 
 `recovered.dba` is a transcription: every line corresponds to statements in
-the listing, which is what makes it checkable.  It is not readable.  `dbp/tidy.py`
-rewrites it as `readable.dba`, which is the same program with:
+the listing, which is what makes it checkable.  It is not readable.  The
+readability pass (`tidy.rs`) rewrites it as `readable.dba`, which is the same
+program with:
 
 * the source-line markers gone (statement order is unchanged, and
   `recovered.dba` still has every original line number);
@@ -485,18 +477,18 @@ from the demangled DLL export; a handful (`SC_*`, and the `*DDD`/`*FFF`/`*OOO`/
 `*SS` maths variants) collapse onto the same keyword and should be read with
 the argument count in mind.
 
-### Recovered result for *Remember*
+### Recovered result for *lostmemory.exe*
 
-`recovered.dba` is 16 640 lines covering:
+`recovered.dba` is 25,602 lines covering:
 
-* 6137 library command calls, with their arguments in source order
-* 2937 assignments, comparisons, arithmetic expressions and array stores
+* 7,739 library command calls, with their arguments in source order
+* 6,597 assignments, comparisons, arithmetic expressions and array stores
   (including the `DIM ARRAY` initialisers)
-* 817 IF tests, 100 FOR/NEXT loops and 57 FUNCTION/ENDFUNCTION blocks
-* the original line number for every statement (2765 distinct source lines)
-* **no undecoded regions**: all 87 045 instructions belong to a statement
+* 1,143 IF tests, 242 FOR/NEXT loops and 175 FUNCTION/ENDFUNCTION blocks
+* the original line number for every statement (4,483 distinct source lines)
+* **no undecoded regions**: all 189,379 instructions belong to a statement
 
-`readable.dba` is the same program in 7512 lines, with the same calls and no
+`readable.dba` is the same program in 13,250 lines, with the same calls and no
 undecoded regions.
 
 Not recovered: variable *identifiers*, comments and REM statements, and the
